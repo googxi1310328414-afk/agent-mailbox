@@ -463,6 +463,23 @@ class McpReviewFixesTest(McpBase):
         m = a.wait_for(lambda m: "__batch__" in m, 10)
         self.assertEqual(sorted(x["id"] for x in m["__batch__"]), [301, 302])
 
+    def test_optional_positionals_on_old_argparse(self):
+        a = self.client("helper-a")
+        a.init()
+        r = a.call("mailbox_tasks", {"action": "set", "id": "T-9", "status": "waiting", "next": "等主控"})
+        self.assertFalse(r.get("isError"), text_of(r))
+        d = a.call("mailbox_tasks", {"action": "show"})["structuredContent"]
+        self.assertEqual([(t["id"], t["status"], t.get("next")) for t in d["tasks"]], [("T-9", "waiting", "等主控")])
+        self.assertFalse(a.call("mailbox_tasks", {"action": "remove", "id": "T-9"}).get("isError"))
+        self.assertEqual(a.call("mailbox_tasks", {"action": "show"})["structuredContent"]["tasks"], [])
+        self.assertTrue(a.call("mailbox_tasks", {"action": "set", "id": "--as=boss"}).get("isError"))
+        self.assertIn("已读", text_of(a.call("mailbox_template", {"name": "ack"})))
+        self.assertTrue(a.call("mailbox_template", {"name": "--help"}).get("isError"))
+        r = a.call("mailbox_status_board", {"action": "put", "key": "RUN-2", "data": {"k": 1}, "to": "boss"})
+        self.assertFalse(r.get("isError"), text_of(r))
+        self.assertIn('"k": 1', text_of(a.call("mailbox_status_board", {"action": "get", "key": "RUN-2"})))
+        self.assertTrue(a.call("mailbox_status_board", {"action": "get", "key": "-RUN"}).get("isError"))
+
     def test_resources_status_json_subscribe_and_list_changed(self):
         boss, a = self.client("boss"), self.client("helper-a")
         boss.init()

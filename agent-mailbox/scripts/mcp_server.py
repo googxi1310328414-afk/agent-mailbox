@@ -16,6 +16,7 @@ import argparse
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 import threading
@@ -187,6 +188,18 @@ def clamp_int(v, lo, hi, default):
 def opt(name, value):
     """拼成 --name=值，值以 - 开头也不会被当成选项。"""
     return "--%s=%s" % (name, value)
+
+
+KEY_OK = re.compile(r"^[A-Za-z][A-Za-z0-9]*(?:-[A-Za-z0-9]+)*$")
+
+
+def safe_positional(v, name):
+    """可选位置参数没法用 -- 隔开（旧版 argparse），所以不许以 - 开头，杜绝被当成选项。"""
+    if not isinstance(v, str) or not v.strip():
+        raise ToolError("需要 %s" % name)
+    if v.startswith("-"):
+        raise ToolError("%s 不能以 - 开头：%s" % (name, v))
+    return v
 
 
 class Server(object):
@@ -852,14 +865,14 @@ class Server(object):
             d = self.cli("tasks", "--json", as_json=True)
             return json.dumps(d, ensure_ascii=False, indent=2), d
         if act in ("set", "remove"):
-            if not a.get("id"):
-                raise ToolError("%s 需要 id" % act)
-            args = ["tasks", act]
+            tid = safe_positional(a.get("id"), "id")
+            # 可选位置参数（nargs=?）紧跟子命令放：Python 3.11 及更早的 argparse 遇到「选项在前、可选位置参数在后」会报多余参数
+            args = ["tasks", act, tid]
             if act == "set":
                 args.append(opt("status", a.get("status") or "open"))
                 if a.get("next"):
                     args.append(opt("next", a["next"]))
-            return self.cli(*(args + ["--", a["id"]])).strip(), None
+            return self.cli(*args).strip(), None
         if act == "replace":
             tmp = self.write_temp(json.dumps(a.get("tasks") or [], ensure_ascii=False), ".json")
             try:
@@ -898,17 +911,18 @@ class Server(object):
         if act == "list":
             d = self.cli("status", "list", "--json", as_json=True)
             return json.dumps(d, ensure_ascii=False, indent=2), {"boards": d}
-        if not a.get("key"):
-            raise ToolError("%s 需要 key" % act)
+        key = a.get("key") or ""
+        if not KEY_OK.match(key):
+            raise ToolError("key 须是字母开头的字母数字，可用 - 连接，如 RUN-W1")
         if act == "get":
-            args = ["status", "get"] + ([opt("box", a["box"])] if a.get("box") else [])
-            return self.cli(*(args + ["--", a["key"]])), None
+            args = ["status", "get", key] + ([opt("box", a["box"])] if a.get("box") else [])
+            return self.cli(*args), None
         if not isinstance(a.get("data"), dict):
             raise ToolError("put 需要 data（JSON 对象）")
         tmp = self.write_temp(json.dumps(a["data"], ensure_ascii=False), ".json")
         try:
-            args = ["status", "put", opt("file", tmp)] + ([opt("to", a["to"])] if a.get("to") else [])
-            return self.cli(*(args + ["--", a["key"]])).strip(), None
+            args = ["status", "put", key, opt("file", tmp)] + ([opt("to", a["to"])] if a.get("to") else [])
+            return self.cli(*args).strip(), None
         finally:
             os.unlink(tmp)
 
@@ -970,7 +984,9 @@ class Server(object):
         return json.dumps(d, ensure_ascii=False, indent=2), d
 
     def t_template(self, a, ctx):
-        return self.cli(*(["template"] + (["--", a["name"]] if a.get("name") else []))), None
+        if a.get("name") and a["name"] not in self.template_names():
+            raise ToolError("没有模板 %s；可用：%s" % (a["name"], "、".join(self.template_names())))
+        return self.cli(*(["template"] + ([a["name"]] if a.get("name") else []))), None
 
     # ------------------------------------------------------------ 资源
     STATIC = [
