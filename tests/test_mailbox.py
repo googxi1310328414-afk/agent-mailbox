@@ -284,10 +284,21 @@ class FlowTest(unittest.TestCase):
             nums.setdefault(int(m.group("num")), []).append(n)
         self.assertEqual(len(sent) + len(legacy_written), sum(len(v) for v in nums.values()))
         ours = set(s["file"] for s in sent)
+        legacy = set(os.path.basename(p) for p, _ in legacy_written)
+        dup = False
         for k, v in nums.items():
-            # 本工具投的信绝不与任何信同号
-            if len(v) > 1:
-                self.assertFalse(ours & set(v), (k, v))
+            if len(v) < 2:
+                continue
+            dup = True
+            mine = [x for x in v if x in ours]
+            # 本工具投的信之间绝不同号
+            self.assertLessEqual(len(mine), 1, (k, v))
+            # 已知限制（protocol.md 第 5 节）：只认无后缀文件名的旧工具看不见 NNN-URGENT.md，
+            # 在本工具复查之后才写 NNN.md 时会同号；只可能是「本工具的带后缀信」与「旧工具的无后缀信」
+            self.assertTrue(all(x in legacy for x in v if x not in ours), (k, v))
+            self.assertTrue(all(x.endswith("-URGENT.md") for x in mine), (k, v))
+        if dup:
+            self.assertIn("同号多信", b.run("doctor")[1])  # 出现了就必须被体检报出来
 
     def test_cursor_corruption_not_wiped(self):
         b = self.b
