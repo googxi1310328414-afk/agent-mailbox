@@ -1,5 +1,6 @@
 ---
 name: agent-mailbox
+license: MIT（完整条款见 LICENSE.txt）
 description: 多模型协作信箱（agent mailbox）。一名主控（controller，始终唯一）带若干助手（assistant，数量可增减），经共享目录里的 Markdown 信件通信；附 MCP 服务（mailbox_send、mailbox_wait 等工具，来信推送），也可直接用命令行；不依赖特定客户端，任何能运行 Python 3.8+ 的大模型或智能体都能用。用于给主控或助手写信、收信与等待来信、开工回执、状态汇报、紧急信、更正、主控交接、增减助手、状态板、任务清单与续接备忘。触发词：信箱、写信、回信、来信、主控、助手、登记、回执、交接、mailbox、letter、inbox、controller、assistant、handover、MCP。
 ---
 

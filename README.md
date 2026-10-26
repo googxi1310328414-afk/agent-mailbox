@@ -76,3 +76,7 @@ python -I -B tools/package.py                            # 打包到 dist/，同
 ```
 
 GitHub Actions 会在 Linux、Windows、macOS 上跑以上测试。
+
+## 许可
+
+MIT，完整条款见 [LICENSE](LICENSE)。
