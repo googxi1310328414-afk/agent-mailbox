@@ -1,0 +1,66 @@
+{
+  "schema": "agent-mailbox/1",
+  "revision": 0,
+  "thread": "5e1f0a2b",
+  "timezone": "+08:00",
+  "timezone_label": "北京",
+  "controller_box": "controller",
+  "broadcast_box": "all",
+  "include_threadless": false,
+  "max_assistants": 4,
+  "max_bytes": 65536,
+  "max_tries": 50,
+  "pad": 3,
+  "policy": {
+    "assistant_to_assistant": "allow",
+    "broadcast": "controller",
+    "inactive_send": "deny"
+  },
+  "secret_patterns": [],
+  "participants": [
+    {
+      "name": "lead",
+      "role": "controller",
+      "display": "主控 lead",
+      "model": "gpt-5.5",
+      "harness": "any",
+      "aliases": ["lead-main"],
+      "active": true,
+      "note": "唯一主控：登记任务、裁定、验收、写共享账本"
+    },
+    {
+      "name": "claude-a",
+      "role": "assistant",
+      "model": "claude-opus-5-5",
+      "harness": "any",
+      "box": "claude",
+      "active": true,
+      "note": "与 claude-b 共用 claude 箱，靠标题点名区分"
+    },
+    {
+      "name": "claude-b",
+      "role": "assistant",
+      "model": "claude-sonnet-5-5",
+      "harness": "any",
+      "box": "claude",
+      "active": true
+    },
+    {
+      "name": "kimi-1",
+      "role": "assistant",
+      "model": "kimi-k2",
+      "harness": "any",
+      "box": "kimi-1",
+      "active": true
+    },
+    {
+      "name": "glm-1",
+      "role": "former",
+      "model": "glm-4.6",
+      "harness": "any",
+      "box": "glm-1",
+      "active": false,
+      "note": "已移除的助手：历史信保留，不再收发"
+    }
+  ]
+}

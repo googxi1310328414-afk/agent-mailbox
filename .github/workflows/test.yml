@@ -1,0 +1,42 @@
+name: test
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ["3.9", "3.13"]
+        include:
+          - os: ubuntu-22.04
+            python: "3.8"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - name: 文本自检（损坏字、CR、BOM、不可见字符）
+        run: python -I -B tools/check_text.py agent-mailbox tests tools
+      - name: 自检
+        run: python -I -B agent-mailbox/scripts/mailbox.py selftest
+      - name: 单元、并发与回归测试
+        run: python -I -B tests/test_mailbox.py
+      - name: MCP 协议测试
+        run: python -I -B tests/test_mcp.py
+      - name: 官方 MCP SDK 一致性
+        if: matrix.python == '3.13'
+        shell: bash
+        run: |
+          npm install --prefix "$RUNNER_TEMP/sdk" @modelcontextprotocol/sdk@1 --no-audit --no-fund --ignore-scripts
+          MCP_SDK_DIR="$RUNNER_TEMP/sdk/node_modules/@modelcontextprotocol/sdk" node tests/sdk_conformance.cjs
+      - name: 打包并复验
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.13'
+        shell: bash
+        run: |
+          python -I -B tools/package.py
+          python -I -B tools/verify_package.py dist/agent-mailbox-*.zip --skip-pi
