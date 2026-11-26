@@ -112,6 +112,13 @@ python -I -B tools/package.py                            # 打包到 dist/，同
 
 GitHub Actions 会在 Linux、Windows、macOS 上跑以上测试。
 
+发版：
+1. 改 `scripts/mailbox.py` 里的 `VERSION`；
+2. 在 [`CHANGELOG.md`](CHANGELOG.md) 写好这一版的说明；
+3. 合并后推 `v<版本号>` 标签。
+
+发版工作流（`.github/workflows/release.yml`）会核对版本号、打包、用解出来的包复验，再建 Release 并上传压缩包与 `.sha256`。
+
 ## 许可
 
 MIT，完整条款见 [LICENSE](LICENSE)。
