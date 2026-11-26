@@ -48,11 +48,11 @@ async function connect(me) {
 	ok(caps && caps.tools && caps.resources && caps.resources.subscribe && caps.prompts && caps.logging, "能力声明齐全", JSON.stringify(caps));
 	ok(/helper-a/.test(a.client.getInstructions() || ""), "服务说明里带本方身份");
 	const tools = (await a.client.listTools()).tools;
-	ok(tools.length === 14 && tools.every(t => t.inputSchema && t.inputSchema.type === "object"), "listTools 通过 SDK 校验，14 个工具");
+	ok(tools.length === 19 && tools.every(t => t.inputSchema && t.inputSchema.type === "object"), "listTools 通过 SDK 校验，19 个工具");
 	ok((await a.client.listPrompts()).prompts.length === 10, "listPrompts 通过校验");
 	const res = (await a.client.listResources()).resources;
 	ok(res.some(r => r.uri === "mailbox://inbox"), "listResources 通过校验");
-	ok((await a.client.listResourceTemplates()).resourceTemplates.length === 2, "listResourceTemplates 通过校验");
+	ok((await a.client.listResourceTemplates()).resourceTemplates.length === 4, "listResourceTemplates 通过校验");
 	const pr = await a.client.getPrompt({ name: "registration", arguments: { to: "helper-a" } });
 	ok(/mailbox_send/.test(pr.messages[0].content.text), "getPrompt 通过校验");
 	await a.client.subscribeResource({ uri: "mailbox://inbox" });
@@ -81,6 +81,26 @@ async function connect(me) {
 	ok(a.seen.some(n => n.method === "notifications/message"), "收到日志通知");
 	r = await a.client.callTool({ name: "mailbox_send", arguments: { subject: "缺正文" } });
 	ok(r.isError === true, "工具错误以 isError 返回");
+
+	// 通话：boss 呼叫 helper-a，helper-a 从来电队列接通并回复
+	const call = boss.client.callTool({ name: "mailbox_call", arguments: { to: "helper-a", text: "SDK 通话：2+2=?", timeout_seconds: 30 } },
+		undefined, { timeout: 60000, resetTimeoutOnProgress: true });
+	let nx = null;
+	for (let i = 0; i < 40 && !(nx && nx.structuredContent && nx.structuredContent.conv); i++) {
+		nx = await a.client.callTool({ name: "mailbox_talk", arguments: { action: "next", wait_seconds: 5 } });
+	}
+	ok(nx && nx.structuredContent && nx.structuredContent.conv, "来电队列接通通话", nx && text(nx));
+	await a.client.callTool({ name: "mailbox_talk", arguments: { action: "say", conv: nx.structuredContent.conv.id, text: "4" } });
+	r = await call;
+	ok(!r.isError && r.structuredContent.replies.length === 1 && r.structuredContent.replies[0].text === "4", "mailbox_call 收到回复", text(r));
+	r = await boss.client.callTool({ name: "mailbox_queue", arguments: { action: "push", queue: "sdk", title: "SDK 任务" } });
+	ok(!r.isError && r.structuredContent.id === 1, "mailbox_queue 投放", text(r));
+	r = await a.client.callTool({ name: "mailbox_queue", arguments: { action: "take", queue: "sdk" } });
+	ok(!r.isError && r.structuredContent.status === "claimed", "mailbox_queue 领取", text(r));
+	r = await a.client.callTool({ name: "mailbox_perm", arguments: { action: "show" } });
+	ok(!r.isError && r.structuredContent.participants[0].name === "helper-a", "mailbox_perm 查看", text(r));
+	r = await a.client.callTool({ name: "mailbox_perm", arguments: { action: "grant", name: "helper-a", perms: ["broadcast"] } });
+	ok(r.isError === true, "助手不能给自己授权");
 
 	await a.client.close();
 	await boss.client.close();

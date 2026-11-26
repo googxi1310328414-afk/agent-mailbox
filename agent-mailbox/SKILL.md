@@ -1,17 +1,24 @@
 ---
 name: agent-mailbox
 license: MIT（完整条款见 LICENSE.txt）
-description: 多模型协作信箱（agent mailbox）。一名主控（controller，始终唯一）带若干助手（assistant，数量可增减），经共享目录里的 Markdown 信件通信；附 MCP 服务（mailbox_send、mailbox_wait 等工具，来信推送），也可直接用命令行；不依赖特定客户端，任何能运行 Python 3.8+ 的大模型或智能体都能用。用于给主控或助手写信、收信与等待来信、开工回执、状态汇报、紧急信、更正、主控交接、增减助手、状态板、任务清单与续接备忘。触发词：信箱、写信、回信、来信、主控、助手、登记、回执、交接、mailbox、letter、inbox、controller、assistant、handover、MCP。
+description: 多模型协作 MCP 服务与信箱（agent mailbox）：通知、队列等待（来电队列、带租约的工作队列）、多模型自由通话（mailbox_call 呼叫并等回复）、主控按人分配权限，外加排他编号、永不覆盖的 Markdown 信件。一名主控（controller，始终唯一）带若干助手（assistant，数量可增减），新模型可申请加入、由主控批准；经共享目录通信，附 MCP 服务（19 个工具，来信、通话、通知实时推送），也可直接用命令行；不依赖特定客户端，任何能运行 Python 3.8+ 的大模型或智能体都能用。用于写信收信、等来信、呼叫别的模型并等回复、接来电、派活与领活、发通知、授予或收回权限、审批加入、开工回执、状态汇报、紧急信、更正、主控交接、增减助手、状态板、任务清单与续接备忘。触发词：信箱、写信、来信、通话、呼叫、来电、队列、派活、领任务、通知、权限、授权、主控、助手、加入、回执、交接、mailbox、call、talk、queue、notify、permission、controller、assistant、handover、MCP。
 ---
 
-# agent-mailbox：多模型协作信箱
+# agent-mailbox：多模型协作信箱、通话与队列
 
-几个模型（或同一模型的几个会话）共用一个**信箱目录**，靠排他创建的 Markdown 文件互相写信。
-主线只有一条：**主控唯一，助手可增减**。主控登记任务、裁定、验收；助手只做登记给自己的事，按时回执和汇报。
+几个模型（或同一模型的几个会话）共用一个**信箱目录**：
+- 正式往来写**信件**：排他创建的 Markdown 文件，永不覆盖；
+- 快速商量用**通话**：一对一或多方，可同步呼叫并等回复；
+- 派活用**工作队列**，提醒用**通知**。
 
-**有 MCP 就用 MCP。** 客户端里若已接上 `agent-mailbox` MCP 服务（工具名形如 `mailbox_send`、`mailbox_inbox`、`mailbox_wait`），
-直接用这些工具：身份和信箱已在服务启动时绑定；等回信调 `mailbox_wait`，不要自己轮询；工具结果末尾的「【新事件】」也要先读原信再处理。
-下文的命令与这些工具一一对应（`send` 对 `mailbox_send`，`inbox` 对 `mailbox_inbox`，依此类推）。接法见 `references/mcp.md`。
+主线只有一条：**主控唯一，助手可增减，权限由主控分配**。主控登记任务、裁定、验收、授权；助手只做登记给自己的事，按时回执和汇报。
+
+**有 MCP 就用 MCP。** 客户端里若已接上 `agent-mailbox` MCP 服务（工具名形如 `mailbox_send`、`mailbox_call`、`mailbox_wait`），直接用这些工具：
+- 身份和信箱已在服务启动时绑定；
+- 等回信、回话调 `mailbox_wait`，不要自己轮询；
+- 工具结果末尾的「【新事件】」：信件先读原信再处理，通话消息已附全文，直接回复。
+
+下文的命令与这些工具一一对应：`send` 对 `mailbox_send`，`talk` 对 `mailbox_talk`，`talk call` 对 `mailbox_call`，`queue` 对 `mailbox_queue`，`notify` 对 `mailbox_notify`，`perm` 对 `mailbox_perm`，依此类推。接法见 `references/mcp.md`。
 
 没有 MCP 时，所有操作都走同一个脚本 `scripts/mailbox.py`（与本文件同目录的 `scripts/` 下，只用 Python 3.8+ 标准库）。下文记作 `mailbox.py`，调用时写它的完整路径：
 
@@ -32,7 +39,7 @@ mailbox.py --mailbox D:/x/mailbox --as <你> inbox   # 本方未读
 ```
 
 - **本方名**：用户或主控告诉你的名字（如 `claude-a`、`lead`）。不知道就问，不要自己编一个去发信。
-- 花名册不存在说明信箱还没初始化：由用户或主控执行 `init`（见第 6 节）。
+- 花名册不存在说明信箱还没初始化：由用户或主控执行 `init`（见第 9 节；MCP 里主控启动时加 `--init` 也行）。
 - 同一身份同一时刻只能有一个会话在用；`watch` 报 `SUPERSEDED` 而你没有重挂过，说明撞了身份，立刻停下问用户。
 
 ## 2. 收信
@@ -70,7 +77,48 @@ mailbox.py ... --as <你> send --subject "交付 T-123" --body-file d.md --attac
 - 回复用 `--reply-to`；只有测试失败、业务异常、需要立刻决定的事才用 `--urgent`。
 - 转述主控裁定时按原信条号原样列全，不重编号、不省略。
 
-## 4. 等信
+## 4. 通话：多模型自由对话
+
+```bash
+mailbox.py ... --as <你> talk call kimi-1 --text "T-3 要不要连带改接口？" --wait 120   # 呼叫并等回复（沿用与对方的一对一通话）
+mailbox.py ... --as <你> talk start --to kimi-1,claude-a --topic "接口评审" --text "各自说说风险"   # 多方通话
+mailbox.py ... --as <你> talk queue                    # 来电队列：等你回复的通话，紧急优先，其余先来后到
+mailbox.py ... --as <你> talk next --wait 60           # 接下一个来电（取队首通话的未读消息并记为已看）
+mailbox.py ... --as <你> talk say c3 --text "同意，按 A 方案" --reply-to 2   # 在通话里发言
+mailbox.py ... --as <你> talk read c3                  # 读记录；talk list 看本方通话与未读
+mailbox.py ... --as <你> talk invite c3 --to glm-1     # 邀请；talk leave 退出；talk close 结束（发起人或主控）
+```
+
+- 通话适合快速问答和商量；登记、回执、交付、裁定仍写信。话要短，一次一件事，不贴凭据。
+- 呼叫时会告诉你对方监视是否在线、这个通话排在对方来电队列第几位；超时不是失败，回复到了照样送来。
+- 收到 `TALK` 事件就用 `talk say` 回复；同时有几个来电时用 `talk next` 按顺序接。
+- 在通话里发言，要对其中每个在任成员都有 `talk` 权限；主控随时可以加入任何通话，有 `talk.audit` 的旁听者可以读任何通话。
+
+## 5. 工作队列：排队派活、领活
+
+```bash
+mailbox.py ... --as <主控> queue create review --desc "代码评审" --lease 1800   # 建队列（租约秒数、最多尝试次数、领取名单）
+mailbox.py ... --as <主控> queue push review --title "审 PR 12" --text "看 diff 与测试" --priority 5   # 投任务；--to 指派给某人
+mailbox.py ... --as <你>   queue take review --wait 300     # 领下一个任务；没有就排队等
+mailbox.py ... --as <你>   queue done review 7 --text "LGTM，报告在 D:/run/REVIEW.md"   # 交结果，投放者会收到通知
+mailbox.py ... --as <你>   queue renew review 7             # 做得久就续租；做不了 queue release 放回；失败 queue fail [--retry]
+mailbox.py ... --as <主控> queue wait review 7 --timeout 600   # 等任务结束拿结果；queue show / job 查看
+```
+
+- 领取顺序：优先级高的先；同优先级里指派给你的先；其余按投放先后。指派给别人的你领不到。
+- 领到的任务有租约（默认 900 秒），到期没完成就放回排队；用完尝试次数（默认 3 次）就判失败并通知投放者。
+- 只领自己做得了的；做不了立刻 `release`，不要占着。
+
+## 6. 通知
+
+```bash
+mailbox.py ... --as <你> notify send --to lead --text "构建已绿，可以开评审" [--urgent]   # 轻量提醒，不占信件编号，最多 4 KB
+mailbox.py ... --as <你> notify list                    # 看没看过的通知（并记为已看）；--all 看历史
+```
+
+派活、任务被领与完成、任务失败、权限变更、加入申请与批准，都会自动出现在相关人的通知里。
+
+## 7. 等信
 
 两种情况，按你所在的运行环境选：
 
@@ -88,11 +136,12 @@ mailbox.py ... --as <你> send --subject "交付 T-123" --body-file d.md --attac
 - `ROSTER`：你的角色或收件箱变了。
 - `LEDGER`：总账里含你标记的新行，需加 `--ledger … --marker …`；`JOURNAL`：JSONL 工作日志新行，需加 `--journal <glob>`。
 - `WAITFILE`：等的文件出现了。
+- `TALK`：通话里的新消息（附全文）；`NOTIFY`：新通知。命令行 `watch` 报过的就算看过。
 - `STATUS-DUE`：该报状态了；`WAIT-STALE`：等太久；`HEARTBEAT`：有未完成任务却长时间无事。
 
 已报过的不会重报。各客户端的具体接法见 `references/harnesses.md`（可选阅读）。
 
-## 5. 任务、备忘、状态板（会话重启后从这里续）
+## 8. 任务、备忘、状态板（会话重启后从这里续）
 
 ```bash
 mailbox.py ... --as <你> tasks set T-123 --status open --next "等 r2 交件后独审"
@@ -102,7 +151,7 @@ mailbox.py ... --as <你> notes append --text "已交 T-123；下一步做判读
 mailbox.py ... --as <你> status put RUN-W1 --file status.json            # 长任务实时快照，整文件原子替换；status get 查看
 ```
 
-## 6. 初始化与花名册：主控唯一，助手可增减（只有主控或用户能改）
+## 9. 初始化与花名册：主控唯一，助手可增减（主控、用户或有 roster.admin 的人能改）
 
 ```bash
 mailbox.py --mailbox D:/x/mailbox init --controller lead --model gpt-5.5 --harness any --as user   # 新信箱
@@ -118,17 +167,44 @@ mailbox.py ... --as <你>   roster update <你> --session 01a1xxxx --model ...  
 
 任何时刻花名册里**恰有一名在任主控**，违反这一条的改动会被拒绝。主控箱按角色归属：交接后新主控收主控箱的全部来信，箱名不变。先 `roster add` 再写登记信，新助手第一次 `inbox` 就能看到。
 
-## 7. 体检与出错
+新模型也可以自己申请加入，排队等主控批准：
+
+```bash
+mailbox.py ... --as glm-1 join --model glm-4.6 --note "擅长写测试" --wait 600    # 申请；MCP 里启动时加 --join 即可
+mailbox.py ... --as <主控> roster requests                                     # 待批的申请
+mailbox.py ... --as <主控> roster approve glm-1 --allow talk:lead --deny broadcast   # 批准，可顺带授权；roster reject glm-1 --reason …
+```
+
+## 10. 权限：主控按人分配
+
+```bash
+mailbox.py ... perm list                                   # 权限目录与角色预设
+mailbox.py ... --as <你> perm show                         # 本方有效权限（预设 + 授予 − 收回）
+mailbox.py ... --as <主控> perm grant kimi-1 broadcast queue.admin:review   # 授予
+mailbox.py ... --as <主控> perm revoke kimi-1 talk:claude-a                 # 收回（压过预设）
+mailbox.py ... --as <主控> perm reset kimi-1                                # 回到角色预设
+mailbox.py ... --as <主控> perm preset assistant --remove broadcast         # 改整个角色的预设
+mailbox.py ... --as <主控> perm token lead --out ~/.lead.token              # 身份令牌：防止别人用 --as 冒充（另见 perm token user）
+```
+
+- 权限写作「键[:范围]」，范围可以是某人、角色组（`@controller`、`@assistants`、`@observers`）或队列名：
+  - 键：`send`、`broadcast`、`notify`、`talk`、`talk.audit`、`queue.push`、`queue.take`、`queue.admin`、`status`、`roster.admin`。
+- 主控与用户永远拥有全部权限。助手默认能写信、通知、通话、投任务、领任务、写状态板，不能广播。旁听者默认只能旁听通话。
+- 默认预设由通信策略推出：`policy` 设成助手互通 `deny`，预设就只剩对主控和旁听者的权限；设成广播 `anyone`，预设就带上 `broadcast`。
+- 判定：显式条目里取最具体的一条（点名 > 角色组 > 不限），同样具体时收回优先；没有显式条目才看角色预设。
+- **被拒时不要换身份、换工具或手写文件绕过去**：如实告诉主控需要什么权限，由主控决定。
+
+## 11. 体检与出错
 
 - `doctor`：只读体检（花名册、命名、同号多信、CR 和损坏字、残留锁、投递后被改动的信）。
-- 退出码：0 成功；1 失败；2 用法或花名册问题；3 `watch` 超时无事；4 `watch` 被另一进程接管；5 已有同名监视且加了 `--no-takeover`。
+- 退出码：0 成功；1 失败；2 用法、花名册或权限问题；3 等待超时或没有可取的（`watch` 无事、呼叫没等到回复、来电队列空、队列没有可领的任务）；4 `watch` 被另一进程接管；5 已有同名监视且加了 `--no-takeover`。
 - 发信报错时不要换途径硬写文件：按提示修好草稿（损坏字、CR、凭据、标题点名）再重投。
 
 ## 参考
 
-- `references/mcp.md`：MCP 服务：启动参数、各客户端配置、14 个工具、资源与提示词、来信推送方式。
-- `references/protocol.md`：目录与文件命名、编号、信头格式、路由、广播、状态板、控制目录、与旧脚本共存。
-- `references/roles.md`：主控与助手的职责和写信纪律。
+- `references/mcp.md`：MCP 服务：启动参数（含 `--init`、`--join`）、各客户端配置、19 个工具、资源与提示词、推送与阻塞等待。
+- `references/protocol.md`：目录与文件命名、编号、信头格式、路由、广播、状态板、通知流、通话、队列、加入申请、权限判定、控制目录、与旧脚本共存。
+- `references/roles.md`：主控与助手的职责、写信与通话纪律、领活与授权的规矩。
 - `references/commands.md`：全部命令和参数（由 `--help` 生成）。
 - `references/harnesses.md`：可选，各常见客户端的等信方式。
 - `templates/`：登记、回执、交付、状态、紧急、更正、交接、阻断、助手调整、取舍提问等信件模板（`mailbox.py template <名>` 打印）。

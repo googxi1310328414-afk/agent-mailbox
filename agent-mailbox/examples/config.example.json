@@ -24,7 +24,9 @@
       "display": "主控 lead",
       "model": "gpt-5.5",
       "harness": "any",
-      "aliases": ["lead-main"],
+      "aliases": [
+        "lead-main"
+      ],
       "active": true,
       "note": "唯一主控：登记任务、裁定、验收、写共享账本"
     },
@@ -35,7 +37,10 @@
       "harness": "any",
       "box": "claude",
       "active": true,
-      "note": "与 claude-b 共用 claude 箱，靠标题点名区分"
+      "note": "与 claude-b 共用 claude 箱，靠标题点名区分；主控授予了 review 队列的管理权",
+      "allow": [
+        "queue.admin:review"
+      ]
     },
     {
       "name": "claude-b",
@@ -51,7 +56,11 @@
       "model": "kimi-k2",
       "harness": "any",
       "box": "kimi-1",
-      "active": true
+      "active": true,
+      "deny": [
+        "talk:claude-b"
+      ],
+      "note": "主控收回了它与 claude-b 直接通话的权限（其余照角色预设）"
     },
     {
       "name": "glm-1",
