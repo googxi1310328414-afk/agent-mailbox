@@ -26,13 +26,15 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - name: 文本自检（损坏字、CR、BOM、不可见字符）
-        run: python -I -B tools/check_text.py agent-mailbox tests tools
+        run: python -I -B tools/check_text.py agent-mailbox tests tools pyproject.toml CHANGELOG.md README.md
       - name: 自检
         run: python -I -B agent-mailbox/scripts/mailbox.py selftest
       - name: 单元、并发与回归测试
         run: python -I -B tests/test_mailbox.py
       - name: MCP 协议测试
         run: python -I -B tests/test_mcp.py
+      - name: Python 包构建测试
+        run: python -I -B tests/test_packaging.py
       - name: 官方 MCP SDK 一致性
         if: matrix.python == '3.13'
         shell: bash
@@ -45,3 +47,9 @@ jobs:
         run: |
           python -I -B tools/package.py
           python -I -B tools/verify_package.py dist/agent-mailbox-*.zip --skip-pi
+      - name: Python 包打包并在虚拟环境里复验
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.13'
+        shell: bash
+        run: |
+          python -I -B tools/build_backend.py dist-py
+          python -I -B tools/verify_wheel.py dist-py/agent_mailbox_mcp-*-py3-none-any.whl

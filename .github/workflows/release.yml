@@ -1,9 +1,14 @@
 name: release
 
-# 发版：核对版本号、打包、用解出来的包复验，再建 Release 并上传压缩包与 .sha256。说明取自 CHANGELOG.md 里「## <版本号>」那一节。
-# 两种触发方式：
+# 发版：核对版本号；打 skill 压缩包与 Python 包（wheel、sdist），各自复验；
+# 再按需发布到 PyPI，最后建 GitHub Release 并上传附件。说明取自 CHANGELOG.md 里「## <版本号>」那一节。
+# 触发方式：
 # - 推 v<版本号> 标签：标签须与 scripts/mailbox.py 的 VERSION 一致；
-# - 在 Actions 页面手动运行（只限默认分支）：按 VERSION 在当前提交上创建 v<版本号> 标签；这一版的标签已存在就停，免得重复发。
+# - 在 Actions 页面手动运行：
+#   - 在默认分支上：按 VERSION 在当前提交上创建 v<版本号> 标签；这一版的标签已存在就停，免得重复发；
+#   - 在已有的版本标签上：补发这一版（例如开启 PyPI 之后补传），已存在的 Release 与 PyPI 文件会跳过。
+# PyPI 用可信发布：在 PyPI 为 agent-mailbox-mcp 配好可信发布者（本仓库、release.yml）后，
+# 把仓库变量 PYPI_PUBLISH 设为 true 才会上传；没设就跳过这一步。
 on:
   push:
     tags: ["v*"]
@@ -11,6 +16,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 concurrency:
   group: release
@@ -38,29 +44,45 @@ jobs:
             fi
           else
             if [ "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ]; then
-              echo "手动发版只能在默认分支 $DEFAULT_BRANCH 上运行，现在是 $GITHUB_REF_NAME"
+              echo "手动发版只能在默认分支 $DEFAULT_BRANCH 或版本标签上运行，现在是 $GITHUB_REF_NAME"
               exit 1
             fi
             if git ls-remote --exit-code --tags origin "refs/tags/$tag" > /dev/null; then
-              echo "标签 $tag 已存在：这一版已经发过。要发新版请先改 VERSION 并在 CHANGELOG.md 写好说明"
+              echo "标签 $tag 已存在：这一版已经发过。要发新版请先改 VERSION 并在 CHANGELOG.md 写好说明；要补发这一版，请在标签 $tag 上运行"
               exit 1
             fi
           fi
           echo "VER=$ver" >> "$GITHUB_ENV"
           echo "TAG=$tag" >> "$GITHUB_ENV"
       - name: 文本自检（损坏字、CR、BOM、不可见字符）
-        run: python -I -B tools/check_text.py agent-mailbox tests tools CHANGELOG.md README.md
-      - name: 打包
+        run: python -I -B tools/check_text.py agent-mailbox tests tools pyproject.toml CHANGELOG.md README.md
+      - name: 打 skill 压缩包
         run: python -I -B tools/package.py
-      - name: 复验（解包后跑自检、单元与 MCP 测试）
+      - name: 复验压缩包（解包后跑自检、单元与 MCP 测试）
         run: python -I -B tools/verify_package.py "dist/agent-mailbox-$VER.zip" --skip-pi
+      - name: 打 Python 包（wheel、sdist）
+        run: python -I -B tools/build_backend.py dist-py
+      - name: 复验 Python 包（在虚拟环境里装好后跑一遍）
+        run: python -I -B tools/verify_wheel.py "dist-py/agent_mailbox_mcp-$VER-py3-none-any.whl"
       - name: 发布说明
         run: python -I -B tools/release_notes.py "$VER" "dist/agent-mailbox-$VER.zip.sha256" > release-notes.md
-      - name: 建 Release 并上传压缩包
+      - name: 发布到 PyPI（仓库变量 PYPI_PUBLISH 设为 true 才发）
+        if: vars.PYPI_PUBLISH == 'true'
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: dist-py/
+          skip-existing: true
+      - name: 建 GitHub Release 并上传附件
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          if gh release view "$TAG" > /dev/null 2>&1; then
+            echo "Release $TAG 已存在，不再新建"
+            exit 0
+          fi
           # 推标签触发时标签已在；手动运行时 gh 在当前提交上创建标签
-          gh release create "$TAG" "dist/agent-mailbox-$VER.zip" "dist/agent-mailbox-$VER.zip.sha256" \
+          gh release create "$TAG" \
+            "dist/agent-mailbox-$VER.zip" "dist/agent-mailbox-$VER.zip.sha256" \
+            "dist-py/agent_mailbox_mcp-$VER-py3-none-any.whl" "dist-py/agent_mailbox_mcp-$VER.tar.gz" \
             --title "agent-mailbox $VER" --notes-file release-notes.md --target "$GITHUB_SHA"

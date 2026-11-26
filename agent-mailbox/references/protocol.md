@@ -15,7 +15,7 @@
 | `.agent-mailbox/tasks/<名>.json` | 任务清单、等待对象、等待文件 | 本人 |
 | `.agent-mailbox/notes/<名>.md` | 续接备忘 | 本人 |
 | `.agent-mailbox/presence/<名>.json` | 监视进程登记（pid、主机、心跳） | 本人的 `watch` |
-| `.agent-mailbox/notify/<名>.jsonl` | 通知流：带序号、只追加 | 发通知的一方与系统（持锁追加） |
+| `.agent-mailbox/notify/<名>.jsonl`、`<名>.archive.jsonl` | 通知流：带序号、只追加；超过 512 KB 时看过的旧条目移到归档 | 发通知的一方与系统（持锁追加） |
 | `.agent-mailbox/talk/c<N>.json`、`c<N>.jsonl` | 通话的成员与状态；通话记录（带序号、只追加） | 通话成员（持锁） |
 | `.agent-mailbox/queues/<队列>.json`、`<队列>.archive.jsonl` | 工作队列的设置与任务；结束较久的任务归档 | 投放、领取、管理队列的各方（持锁读改写） |
 | `.agent-mailbox/requests/<名>.json` | 加入申请 | 申请者；主控或 `roster.admin` 审批 |
@@ -219,6 +219,11 @@ to-<箱>-<线程>-<KEY>-STATUS.json        KEY：大写字母数字，可用 - �
   - `join`、`joined`：加入申请，加入已批准。
 - 文字最多 4 KB，经卫生检查与凭据拦截。
 - 收件人游标里的 `notify_seen` 是已看序号：MCP 送达、命令行 `watch` 报出、`notify list` 列出，都把它往前推。
+- 归档：追加之后若通知流超过 512 KB，在同一把锁里把旧条目移到 `<名>.archive.jsonl`。
+  - 第一条没看过的、以及倒数第 500 条，从两者中靠前的那条起留在原处；
+  - 本人一直不看时，最多为他留 1 万条；
+  - 先写归档、再原子替换原文件，中途崩溃只会在归档里多出一份，不会丢；序号不变。
+- 读的一方增量读取：文件只是变长了，就只读新增的完整行；被替换（inode 或开头字节变了）或变短才整读。通话记录同样增量读取，不归档。
 - 给别人发通知要有 `notify` 权限，发给全体要有 `broadcast`。
 
 通话：

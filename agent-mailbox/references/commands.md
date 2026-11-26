@@ -13,7 +13,7 @@ usage: mailbox.py [-h] [--mailbox MAILBOX] [--config CONFIG] [--state-dir STATE_
                   [--token-file TOKEN_FILE] [--read-only] [--json] [--version]
                   <命令> ...
 
-agent-mailbox 1.1.0：多模型协作信箱（主控唯一，助手可增减）
+agent-mailbox 1.2.0：多模型协作信箱（主控唯一，助手可增减）
 
 positional arguments:
   <命令>

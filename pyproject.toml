@@ -1,0 +1,7 @@
+# 打包由仓库自带的 tools/build_backend.py 完成（PEP 517，只用标准库，不需要任何构建依赖）。
+# 发行名 agent-mailbox-mcp，版本号取自 agent-mailbox/scripts/mailbox.py 的 VERSION，其余元数据见该文件。
+# 装好后有两个命令：agent-mailbox-mcp（MCP 服务）、agent-mailbox（命令行）。
+[build-system]
+requires = []
+build-backend = "build_backend"
+backend-path = ["tools"]

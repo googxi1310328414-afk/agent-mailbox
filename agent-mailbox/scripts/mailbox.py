@@ -30,7 +30,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 SCHEMA = "agent-mailbox/1"
 CONTROL = ".agent-mailbox"
 SKILL_NAME = "agent-mailbox"
@@ -1570,11 +1570,24 @@ def append_seq(path, make):
     return rec
 
 
-def jsonl_append(mb, lockname, path, make):
-    """持锁取下一个序号并追加一行。拿不到锁就报错，绝不无锁取号。"""
+def jsonl_append(mb, lockname, path, make, after=None):
+    """持锁取下一个序号并追加一行；after() 在放锁前执行（例如归档旧条目）。拿不到锁就报错，绝不无锁取号。"""
     mb.require_writable()
     with FileLock(mb.p("locks", lockname)):
-        return append_seq(path, make)
+        rec = append_seq(path, make)
+        if after is not None:
+            after()
+        return rec
+
+
+def append_bytes(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0), 0o644)
+    try:
+        while data:
+            data = data[os.write(fd, data):]
+    finally:
+        os.close(fd)
 
 
 _FILE_CACHE = {}
@@ -1602,12 +1615,8 @@ def cached_load(path, loader):
     return val
 
 
-def jsonl_read(path, after=0):
-    """读出序号大于 after 的记录（按序号）；看不懂的行、残行跳过，同号只取第一条。"""
-    raw = read_bytes_retry(path)
-    if raw is None:
-        return []
-    out, seen = [], set()
+def _parse_records(raw, seqs, out, after=0):
+    """把一段 JSONL 里序号大于 after、还没见过的记录追加到 out；看不懂的行、残行跳过，同号只取第一条。"""
     for line in raw.split(b"\n"):
         if not line.strip():
             continue
@@ -1617,11 +1626,63 @@ def jsonl_read(path, after=0):
             continue
         if not isinstance(e, dict) or not isinstance(e.get("seq"), int) or isinstance(e.get("seq"), bool):
             continue
-        if e["seq"] > after and e["seq"] not in seen:
-            seen.add(e["seq"])
+        if e["seq"] > after and e["seq"] not in seqs:
+            seqs.add(e["seq"])
             out.append(e)
+
+
+def jsonl_read(path, after=0):
+    """整读：序号大于 after 的记录（按序号）。"""
+    raw = read_bytes_retry(path)
+    if raw is None:
+        return []
+    out = []
+    _parse_records(raw, set(), out, after)
     out.sort(key=lambda e: e["seq"])
     return out
+
+
+_TAIL = {}
+_TAIL_LOCK = threading.Lock()
+
+
+def jsonl_records(path):
+    """只追加 JSONL 的增量读取（监视与送达每秒都查）：文件只是变长了，就只读新增的完整行；
+    被替换（归档后）、变短或开头变了才整读。返回按序号排好的列表；每次有新内容都返回新列表，调用方不要改它。"""
+    with _TAIL_LOCK:
+        try:
+            st = os.stat(path)
+        except OSError:
+            _TAIL.pop(path, None)
+            return []
+        ident = (st.st_dev, st.st_ino)
+        c = _TAIL.get(path)
+        if c is not None and c["ident"] == ident and c["offset"] == st.st_size:
+            return c["recs"]
+        try:
+            with open(path, "rb") as f:
+                head = f.read(256)
+                if (c is None or c["ident"] != ident or st.st_size < c["offset"]
+                        or head[:len(c["head"])] != c["head"]):
+                    c = {"ident": ident, "offset": 0, "recs": [], "seqs": set(), "head": b""}
+                f.seek(c["offset"])
+                chunk = f.read()
+        except OSError:
+            return c["recs"] if c is not None else []  # 正被替换（Windows 上会短暂拒绝访问）：先用上次的，下一轮再读
+        cut = chunk.rfind(b"\n")  # 最后一行可能还没写完，留到下一轮
+        if cut >= 0:
+            new = []
+            _parse_records(chunk[:cut], c["seqs"], new)
+            recs = c["recs"] + new
+            if any(recs[i]["seq"] > recs[i + 1]["seq"] for i in range(max(0, len(c["recs"]) - 1), len(recs) - 1)):
+                recs.sort(key=lambda e: e["seq"])
+            c["recs"], c["offset"] = recs, c["offset"] + cut + 1
+        if len(head) > len(c["head"]):
+            c["head"] = head
+        if len(_TAIL) > 2000:
+            _TAIL.clear()
+        _TAIL[path] = c
+        return c["recs"]
 
 
 def check_text(text, what, limit, allow_secret=False, extra=None):
@@ -1642,10 +1703,45 @@ def check_text(text, what, limit, allow_secret=False, extra=None):
 
 # ------------------------------------------------------------------ 通知
 NOTIFY_MAX = 4096
+NOTIFY_ROTATE_BYTES = 512 * 1024  # 通知流超过这么大，就把旧条目移到归档
+NOTIFY_KEEP = 500                 # 归档后至少留下最近这么多条
+NOTIFY_KEEP_UNSEEN = 10000        # 本人一直不看时，最多为他留这么多条没看过的
 
 
 def feed_path(mb, name):
     return mb.p("notify", name + ".jsonl")
+
+
+def feed_archive_path(mb, name):
+    return mb.p("notify", name + ".archive.jsonl")
+
+
+def rotate_feed(mb, name):
+    """（持这条通知流的锁调用）超过 NOTIFY_ROTATE_BYTES 时，把旧条目移到 <名>.archive.jsonl；
+    本人还没看过的、以及最近 NOTIFY_KEEP 条留在原处。序号不变，已看指针照旧有效。返回移走的条数。"""
+    path = feed_path(mb, name)
+    try:
+        if os.path.getsize(path) <= NOTIFY_ROTATE_BYTES:
+            return 0
+        recs = jsonl_read(path)
+        if len(recs) <= NOTIFY_KEEP:
+            return 0
+        # 按条数算（不按序号差）：从第一条没看过的、和倒数第 NOTIFY_KEEP 条里取靠前的那个留起；最多留 NOTIFY_KEEP_UNSEEN 条
+        seen = seen_pointers(mb, name)[0]
+        first_unseen = next((i for i, r in enumerate(recs) if r["seq"] > seen), len(recs))
+        start = max(min(first_unseen, len(recs) - NOTIFY_KEEP), len(recs) - NOTIFY_KEEP_UNSEEN, 0)
+        old, keep = recs[:start], recs[start:]
+        if not old:
+            return 0
+
+        def enc(rs):
+            return b"".join((json.dumps(r, ensure_ascii=False) + "\n").encode("utf-8") for r in rs)
+        append_bytes(feed_archive_path(mb, name), enc(old))  # 先写归档：中途崩溃只会多出一份，不会丢
+        atomic_write(path, enc(keep))
+        return len(old)
+    except (OSError, CliError) as e:
+        warn("（%s 的通知流归档没做成，下次再试：%s）" % (name, str(e).split("\n")[0]))
+        return 0
 
 
 def notify_push(mb, name, kind, text, frm="", title="", urgent=False, ref=None):
@@ -1655,7 +1751,7 @@ def notify_push(mb, name, kind, text, frm="", title="", urgent=False, ref=None):
         if ref:
             rec["ref"] = ref
         return rec
-    return jsonl_append(mb, "notify-%s.lock" % name, feed_path(mb, name), make)
+    return jsonl_append(mb, "notify-%s.lock" % name, feed_path(mb, name), make, after=lambda: rotate_feed(mb, name))
 
 
 def notify_system(mb, names, kind, text, frm="", title="", urgent=False, ref=None):
@@ -1695,7 +1791,7 @@ def seen_pointers(mb, name):
 def notify_unseen(mb, name, seen=None):
     if seen is None:
         seen = seen_pointers(mb, name)[0]
-    return [e for e in (cached_load(feed_path(mb, name), jsonl_read) or []) if e["seq"] > seen]
+    return [e for e in jsonl_records(feed_path(mb, name)) if e["seq"] > seen]
 
 
 def iso_at(epoch):
@@ -1794,7 +1890,7 @@ def talk_meta(mb, cid, fresh=False):
 
 def talk_log(mb, cid, fresh=False):
     path = talk_log_path(mb, cid)
-    return jsonl_read(path) if fresh else (cached_load(path, jsonl_read) or [])
+    return jsonl_read(path) if fresh else jsonl_records(path)
 
 
 def talk_member(meta, name):
@@ -3271,7 +3367,7 @@ class Watcher(object):
     def poll_notify(self):
         name = self.me["name"]
         try:
-            items = cached_load(feed_path(self.mb, name), jsonl_read) or []
+            items = jsonl_records(feed_path(self.mb, name))
         except CliError as e:
             self.add("ERROR", "通知流读不了：%s" % str(e).split("\n")[0], real=False)
             return
@@ -3999,8 +4095,10 @@ def cmd_notify_list(a):
         s = seen_upto(seen, unseen, set(e["seq"] for e in items))
         if s > seen:
             advance_seen(mb, me["name"], notify=s)
+    archive = feed_archive_path(mb, me["name"])
+    archive = slash(archive) if os.path.exists(archive) else ""
     if a.json:
-        emit_json({"me": me["name"], "seen": seen, "unseen": len(unseen), "items": items})
+        emit_json({"me": me["name"], "seen": seen, "unseen": len(unseen), "items": items, "archive": archive})
         return 0
     emit("%s 的通知｜未看 %d 条%s" % (me["name"], len(unseen), "｜列出最近 %d 条" % len(items) if a.all else ""))
     for e in items:
@@ -4008,6 +4106,8 @@ def cmd_notify_list(a):
             emit("  " + l)
     if not items:
         emit("  （没有%s）" % ("通知" if a.all else "未看的通知"))
+    if a.all and archive:
+        emit("  （更早、已看过的通知归档在 %s）" % archive)
     return 0
 
 

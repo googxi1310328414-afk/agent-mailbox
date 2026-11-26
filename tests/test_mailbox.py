@@ -1233,6 +1233,106 @@ class CollabWatchTest(unittest.TestCase):
         self.assertEqual(b.jrun("who")[2]["talk_unread"], 0)
 
 
+class IncrementalReadTest(unittest.TestCase):
+    """通知流与通话记录的增量读取、通知流归档。"""
+
+    def setUp(self):
+        self.b = Box()
+
+    def tearDown(self):
+        self.b.close()
+
+    @staticmethod
+    def line(seq, text="x"):
+        return (json.dumps({"seq": seq, "from": "boss", "kind": "note", "text": text}, ensure_ascii=False) + "\n").encode("utf-8")
+
+    def test_jsonl_records_incremental_and_replacement(self):
+        p = os.path.join(self.b.dir, "feed.jsonl")
+        with open(p, "wb") as f:
+            f.write(self.line(1) + self.line(2) + b"not json\n" + self.line(2, "dup") + self.line(3))
+        first = M.jsonl_records(p)
+        self.assertEqual([(r["seq"], r["text"]) for r in first], [(1, "x"), (2, "x"), (3, "x")])
+        self.assertIs(M.jsonl_records(p), first)  # 文件没变，直接用缓存
+        with open(p, "ab") as f:
+            f.write(self.line(4)[:-6])  # 写到一半的残行
+        self.assertEqual([r["seq"] for r in M.jsonl_records(p)], [1, 2, 3])
+        with open(p, "ab") as f:
+            f.write(self.line(4)[-6:] + self.line(5))
+        now = M.jsonl_records(p)
+        self.assertEqual([r["seq"] for r in now], [1, 2, 3, 4, 5])
+        self.assertEqual(len(first), 3)  # 之前返回的列表不被改动
+        M.atomic_write(p, self.line(4) + self.line(5) + self.line(6))  # 归档后整文件替换
+        self.assertEqual([r["seq"] for r in M.jsonl_records(p)], [4, 5, 6])
+        with open(p, "r+b") as f:  # 原地改写成别的内容、而且更长：靠开头字节识别出来，整读
+            f.write(self.line(10, "y" * 300) + self.line(11))
+        self.assertEqual([(r["seq"], len(r["text"])) for r in M.jsonl_records(p)][:2], [(10, 300), (11, 1)])
+        os.unlink(p)
+        self.assertEqual(M.jsonl_records(p), [])
+
+    def test_feed_rotation_keeps_unseen_and_recent(self):
+        b = self.b
+        mb = b.mailbox()
+        saved = (M.NOTIFY_ROTATE_BYTES, M.NOTIFY_KEEP, M.NOTIFY_KEEP_UNSEEN)
+        M.NOTIFY_ROTATE_BYTES, M.NOTIFY_KEEP, M.NOTIFY_KEEP_UNSEEN = 3000, 5, 1000
+        try:
+            feed, arch = M.feed_path(mb, "helper-a"), M.feed_archive_path(mb, "helper-a")
+            for i in range(40):
+                M.notify_push(mb, "helper-a", "note", "第 %d 条" % (i + 1), "boss")
+            self.assertGreater(os.path.getsize(feed), 3000)
+            self.assertFalse(os.path.exists(arch))  # 一条都没看过：全部留着
+            M.advance_seen(mb, "helper-a", notify=30)
+            self.assertEqual([e["seq"] for e in M.notify_unseen(mb, "helper-a")], list(range(31, 41)))
+            M.notify_push(mb, "helper-a", "note", "第 41 条", "boss")
+            self.assertEqual([r["seq"] for r in M.jsonl_read(feed)], list(range(31, 42)))  # 看过的移走，没看过的留下
+            self.assertEqual([r["seq"] for r in M.jsonl_read(arch)], list(range(1, 31)))
+            self.assertEqual([e["seq"] for e in M.notify_unseen(mb, "helper-a")], list(range(31, 42)))  # 缓存识别出替换
+            d = b.jrun("notify", "list", "--as", "helper-a", "--peek")
+            self.assertEqual((d["seen"], d["unseen"]), (30, 11))
+            self.assertTrue(d["archive"].endswith("helper-a.archive.jsonl"))
+            self.assertEqual(M.notify_push(mb, "helper-a", "note", "接着来", "boss")["seq"], 42)  # 序号连续
+            M.advance_seen(mb, "helper-a", notify=42)
+            for i in range(40):
+                M.notify_push(mb, "helper-a", "note", "又一条", "boss")
+            live = [r["seq"] for r in M.jsonl_read(feed)]
+            self.assertGreaterEqual(len(live), 5)  # 全看过了：至少留最近 5 条
+            self.assertEqual(live[-1], 82)
+            M.NOTIFY_KEEP_UNSEEN = 20  # 一直不看的人：最多留 20 条
+            for i in range(60):
+                M.notify_push(mb, "helper-a", "note", "没人看", "boss")
+            live = [r["seq"] for r in M.jsonl_read(feed)]
+            self.assertLessEqual(len(live), 21)
+            self.assertEqual(live[-1], 142)
+            every = sorted(set(live) | set(r["seq"] for r in M.jsonl_read(arch)))
+            self.assertEqual(every, list(range(1, 143)))  # 留下的加归档的，一条不少
+        finally:
+            M.NOTIFY_ROTATE_BYTES, M.NOTIFY_KEEP, M.NOTIFY_KEEP_UNSEEN = saved
+
+    def test_concurrent_pushes_across_rotation(self):
+        b = self.b
+        mb = b.mailbox()
+        feed, arch = M.feed_path(mb, "helper-a"), M.feed_archive_path(mb, "helper-a")
+        os.makedirs(os.path.dirname(feed), exist_ok=True)
+        n, size = 0, 0
+        with open(feed, "wb") as f:  # 先写到离默认阈值只差一点
+            while size < M.NOTIFY_ROTATE_BYTES - 1500:
+                n += 1
+                data = self.line(n, "预先写入的通知 %d" % n)
+                f.write(data)
+                size += len(data)
+        M.advance_seen(mb, "helper-a", notify=n)
+        procs = [b.popen("notify", "send", "--as", "helper-%s" % "bc"[i % 2], "--to", "helper-a", "--text", "并发 %d" % i)
+                 for i in range(12)]
+        for p in procs:
+            p.communicate(timeout=180)
+        self.assertTrue(all(p.returncode == 0 for p in procs))
+        live = [r["seq"] for r in M.jsonl_read(feed)]
+        archived = [r["seq"] for r in M.jsonl_read(arch)]
+        self.assertTrue(archived, "应该跨过阈值发生了归档")
+        self.assertEqual(live, list(range(live[0], n + 13)))  # 留下的连续、到最后一条
+        self.assertEqual(sorted(set(live) | set(archived)), list(range(1, n + 13)))
+        self.assertEqual(b.jrun("notify", "list", "--as", "helper-a", "--peek")["unseen"], 12)
+
+
 class InstallTest(unittest.TestCase):
     def test_install_dedupe_force_backup(self):
         home = tempfile.mkdtemp(prefix="amb-home-")
