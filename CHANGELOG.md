@@ -2,6 +2,20 @@
 
 每一版的说明写在「## 版本号」下面。发版时（推 `v<版本号>` 标签，或在 Actions 页面手动运行 `release` 工作流），发版工作流会把这一节连同压缩包的 SHA-256 作为 Release 说明。
 
+## 1.2.1
+
+MCP 服务能直接查版本号了。
+
+### 改进
+
+- `agent-mailbox-mcp --version` 打印版本号后退出，不起服务；用压缩包时是 `mcp_server.py --version`。输出与 `agent-mailbox --version` 相同，也就是握手时报的版本。原来会报参数错误。
+- 已上架 PyPI，1.2.0 也已补传：`uvx agent-mailbox-mcp …`、`pipx install agent-mailbox-mcp` 可以直接用。文档里「发布到 PyPI 之前」的写法改为：要用 GitHub 上还没发版的代码，再用 `uvx --from git+https://github.com/googxi1310328414-afk/agent-mailbox …`。
+
+### 安装
+
+- `uvx agent-mailbox-mcp --mailbox <信箱目录> --as <本方名> [--init | --join]`，或 `pipx install agent-mailbox-mcp`。
+- 也可以照旧下载 `agent-mailbox-1.2.1.zip`，当 Agent Skill 用，或用 `python -I -B agent-mailbox/scripts/mcp_server.py …` 运行。
+
 ## 1.2.0
 
 一行接入，长期使用也不变慢。

@@ -2,7 +2,7 @@
 用法：python -I -B verify_wheel.py <wheel 文件>
 
 - 核对 RECORD 里每个文件的 SHA-256 与大小；
-- agent-mailbox --version、python -m agent_mailbox --version；
+- agent-mailbox --version、python -m agent_mailbox --version、agent-mailbox-mcp --version 三者一致；
 - agent-mailbox template（模板随包分发）与 agent-mailbox selftest（全流程自检）；
 - agent-mailbox-mcp --init 起一个 MCP 服务：握手、19 个工具、10 个提示词、读 mailbox://doc/protocol。
 """
@@ -94,7 +94,10 @@ def main():
         cli, server = exe(env_dir, "agent-mailbox"), exe(env_dir, "agent-mailbox-mcp")
         out = subprocess.run([cli, "--version"], stdout=subprocess.PIPE, timeout=60).stdout.decode("utf-8").strip()
         out2 = subprocess.run([py, "-m", "agent_mailbox", "--version"], stdout=subprocess.PIPE, timeout=60).stdout.decode("utf-8").strip()
-        step("agent-mailbox --version 与 python -m agent_mailbox", out.startswith("agent-mailbox ") and out == out2, out)
+        out3 = subprocess.run([server, "--version"], stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                              timeout=60).stdout.decode("utf-8").strip()
+        step("agent-mailbox --version、python -m agent_mailbox 与 agent-mailbox-mcp --version",
+             out.startswith("agent-mailbox ") and out == out2 == out3, out)
         out = subprocess.run([cli, "template"], stdout=subprocess.PIPE, timeout=60).stdout.decode("utf-8")
         step("模板随包分发", "registration" in out and "handover" in out, out.strip()[:120])
         p = subprocess.run([cli, "selftest"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=600)

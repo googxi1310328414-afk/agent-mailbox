@@ -1929,6 +1929,7 @@ def delivery_data(d):
 
 def build_parser():
     p = argparse.ArgumentParser(prog="mcp_server.py", description="agent-mailbox MCP 服务（stdio）")
+    p.add_argument("--version", action="version", version="agent-mailbox " + core.VERSION, help="打印版本号后退出")
     p.add_argument("--mailbox", "-m", default=os.environ.get("AGENT_MAILBOX_DIR"), help="信箱目录（或环境变量 AGENT_MAILBOX_DIR）")
     p.add_argument("--as", dest="me", default=os.environ.get("AGENT_MAILBOX_ME"), help="本方参与方名（或环境变量 AGENT_MAILBOX_ME）")
     p.add_argument("--config", default=os.environ.get("AGENT_MAILBOX_CONFIG"))

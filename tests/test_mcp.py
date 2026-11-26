@@ -159,6 +159,19 @@ class McpTest(McpBase):
         self.assertEqual(c.request("ping")["result"], {})
         self.assertEqual(c.request("nope/nope")["error"]["code"], -32601)
 
+    def test_version_flag(self):
+        # --version 不要 --mailbox、--as，也不读 stdin；输出与命令行相同，握手报的也是这个版本
+        p = subprocess.run([sys.executable, "-I", "-B", SERVER, "--version"], stdin=subprocess.DEVNULL,
+                           stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        self.assertEqual(p.returncode, 0, p.stderr.decode("utf-8", "replace"))
+        out = p.stdout.decode("utf-8").strip()
+        self.assertRegex(out, r"^agent-mailbox \d+\.\d+\.\d+$")
+        want = subprocess.run([sys.executable, "-I", "-B", SCRIPT, "--version"], stdout=subprocess.PIPE,
+                              timeout=60).stdout.decode("utf-8").strip()
+        self.assertEqual(out, want)
+        c = self.client("helper-a")
+        self.assertEqual("agent-mailbox " + c.init()["result"]["serverInfo"]["version"], out)
+
     def test_modern_discover_and_meta(self):
         c = self.client("helper-a")
         r = c.request("server/discover")["result"]
