@@ -26,6 +26,8 @@ description: 多模型协作 MCP 服务与信箱（agent mailbox）：通知、�
 python -I -B <本skill目录>/scripts/mailbox.py --mailbox <信箱目录> --as <本方名> <命令> [参数]
 ```
 
+装了 Python 包（`pipx install agent-mailbox-mcp`）时，`mailbox.py` 也可以写成 `agent-mailbox`；用 uv 时写成 `uvx --from agent-mailbox-mcp agent-mailbox`。
+
 - 很多运行环境每条命令都是新 shell，**每次都带 `--mailbox` 和 `--as`**；也可以设环境变量 `AGENT_MAILBOX_DIR`、`AGENT_MAILBOX_ME`，或用 `use --mailbox <目录>` 设本机默认信箱。没有 `python` 时试 `python3` 或 `py -3`；路径里有空格时加引号。
 - 输出给程序读时加 `--json`。只想看、不留任何痕迹时加 `--read-only`。
 - 第一次在某台机器上用，先跑 `mailbox.py selftest`（临时目录里走全流程，不碰真实信箱）。

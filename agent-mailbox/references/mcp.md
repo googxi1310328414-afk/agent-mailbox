@@ -8,9 +8,16 @@
 
 ## 启动参数
 
+三种起法，参数完全一样：
+
 ```bash
-python -I -B <skill>/scripts/mcp_server.py --mailbox <信箱目录> --as <本方名> [选项]
+uvx agent-mailbox-mcp --mailbox <信箱目录> --as <本方名> [选项]                 # 用 uv，从 PyPI 取（推荐）
+agent-mailbox-mcp --mailbox <信箱目录> --as <本方名> [选项]                      # pipx install agent-mailbox-mcp 之后
+python -I -B <skill>/scripts/mcp_server.py --mailbox <信箱目录> --as <本方名> [选项]   # 用 skill 压缩包
 ```
+
+发布到 PyPI 之前，uv 也能直接从 GitHub 取：`uvx --from git+https://github.com/googxi1310328414-afk/agent-mailbox agent-mailbox-mcp …`。
+包里没有任何依赖；uv、pip 从源码构建时用的是仓库自带的标准库打包后端，也不用下载构建依赖。
 
 | 选项 | 默认 | 说明 |
 |---|---|---|
@@ -38,10 +45,12 @@ python -I -B <skill>/scripts/mcp_server.py --mailbox <信箱目录> --as <本方
 
 下面的命令和配置项是写作时各客户端的现行写法，以客户端自己的文档为准。路径换成实际值；Windows 路径写正斜杠或双反斜杠。
 
+下面的例子都用 `uvx agent-mailbox-mcp`；用压缩包时，把它换成 `python -I -B <skill>/scripts/mcp_server.py`（JSON、TOML 里 `command` 写 `python`，`args` 开头加 `"-I", "-B", "<skill>/scripts/mcp_server.py"`）。
+
 **Claude Code**
 
 ```bash
-claude mcp add agent-mailbox -- python -I -B <skill>/scripts/mcp_server.py --mailbox <信箱目录> --as <本方名>
+claude mcp add agent-mailbox -- uvx agent-mailbox-mcp --mailbox <信箱目录> --as <本方名>
 ```
 
 - 想让来信直接注入会话：用频道方式启动，`claude --dangerously-load-development-channels server:agent-mailbox`。这是研究预览功能，要交互式会话，启动时会弹确认框。
@@ -52,16 +61,16 @@ claude mcp add agent-mailbox -- python -I -B <skill>/scripts/mcp_server.py --mai
 
 ```toml
 [mcp_servers.agent-mailbox]
-command = "python"
-args = ["-I", "-B", "<skill>/scripts/mcp_server.py", "--mailbox", "<信箱目录>", "--as", "<本方名>"]
+command = "uvx"
+args = ["agent-mailbox-mcp", "--mailbox", "<信箱目录>", "--as", "<本方名>"]
 tool_timeout_sec = 600
 ```
 
-`codex mcp add agent-mailbox -- python -I -B …` 也行，但它不写超时，`tool_timeout_sec` 要手动加。
+`codex mcp add agent-mailbox -- uvx agent-mailbox-mcp …` 也行，但它不写超时，`tool_timeout_sec` 要手动加。
 
 **Pi**
 
-`pi mcp add agent-mailbox -- python -I -B …`，或写进 `~/.pi/agent/mcp.json` 的 `mcpServers`。请求超时默认 60 秒，进度通知会重置计时。
+`pi mcp add agent-mailbox -- uvx agent-mailbox-mcp …`，或写进 `~/.pi/agent/mcp.json` 的 `mcpServers`。请求超时默认 60 秒，进度通知会重置计时。
 
 **Cursor、Kimi、Gemini CLI 等使用 `mcpServers` JSON 的客户端**
 
@@ -69,8 +78,8 @@ tool_timeout_sec = 600
 {
   "mcpServers": {
     "agent-mailbox": {
-      "command": "python",
-      "args": ["-I", "-B", "<skill>/scripts/mcp_server.py", "--mailbox", "<信箱目录>", "--as", "<本方名>", "--join", "--model", "<模型>"]
+      "command": "uvx",
+      "args": ["agent-mailbox-mcp", "--mailbox", "<信箱目录>", "--as", "<本方名>", "--join", "--model", "<模型>"]
     }
   }
 }

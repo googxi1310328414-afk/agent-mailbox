@@ -39,17 +39,24 @@
 
 ## 快速开始（只用 MCP）
 
-1. 下载 [Releases](../../releases) 里的 `agent-mailbox-<版本>.zip` 并解压，下文 `<skill>` 指解出的 `agent-mailbox/` 目录。也可以直接克隆本仓库。
+1. 选一种方式运行 MCP 服务，都不需要装任何依赖：
+
+   | 方式 | 起服务的命令 |
+   |---|---|
+   | [uv](https://docs.astral.sh/uv/)（推荐） | `uvx agent-mailbox-mcp …`；发布到 PyPI 之前用 `uvx --from git+https://github.com/googxi1310328414-afk/agent-mailbox agent-mailbox-mcp …` |
+   | pipx / pip | `pipx install agent-mailbox-mcp` 之后用 `agent-mailbox-mcp …`；命令行是 `agent-mailbox …` |
+   | 压缩包 | 下载 [Releases](../../releases) 里的 `agent-mailbox-<版本>.zip` 解压，用 `python -I -B <skill>/scripts/mcp_server.py …`；当 Agent Skill 用也是这个包 |
+
 2. 主控接上 MCP，信箱不存在时 `--init` 会以它为主控建好。以 Claude Code 为例：
 
    ```bash
-   claude mcp add agent-mailbox -- python -I -B <skill>/scripts/mcp_server.py --mailbox /path/to/mailbox --as lead --init --model gpt-5.5
+   claude mcp add agent-mailbox -- uvx agent-mailbox-mcp --mailbox /path/to/mailbox --as lead --init --model gpt-5.5
    ```
 
 3. 其它模型用自己的名字接入，并加 `--join` 申请加入：
 
    ```bash
-   claude mcp add agent-mailbox -- python -I -B <skill>/scripts/mcp_server.py --mailbox /path/to/mailbox --as kimi-1 --join --model kimi-k2
+   claude mcp add agent-mailbox -- uvx agent-mailbox-mcp --mailbox /path/to/mailbox --as kimi-1 --join --model kimi-k2
    ```
 
    - 主控会收到 `NOTIFY [join]`，用 `mailbox_roster` 的 `approve` 批准，可以顺带 `allow` / `deny` 授权。
@@ -68,13 +75,13 @@
    | 等任何新动静 | `mailbox_wait` |
    | 授权或收回 | `mailbox_perm`：`grant` / `revoke`（只有主控） |
 
-不接 MCP 也行，同样的能力都有命令行：
+不接 MCP 也行，同样的能力都有命令行：装了包就用 `agent-mailbox`（或 `uvx --from agent-mailbox-mcp agent-mailbox`），用压缩包就是 `python -I -B <skill>/scripts/mailbox.py`。
 
 ```bash
-python -I -B <skill>/scripts/mailbox.py --mailbox /path/to/mailbox init --controller lead --as user
-python -I -B <skill>/scripts/mailbox.py --mailbox /path/to/mailbox --as lead roster add kimi-1 --model kimi-k2
-python -I -B <skill>/scripts/mailbox.py --mailbox /path/to/mailbox --as kimi-1 talk call lead --text "T-3 要不要连带改接口？" --wait 120
-python -I -B <skill>/scripts/mailbox.py --mailbox /path/to/mailbox --as lead perm revoke kimi-1 broadcast
+agent-mailbox --mailbox /path/to/mailbox init --controller lead --as user
+agent-mailbox --mailbox /path/to/mailbox --as lead roster add kimi-1 --model kimi-k2
+agent-mailbox --mailbox /path/to/mailbox --as kimi-1 talk call lead --text "T-3 要不要连带改接口？" --wait 120
+agent-mailbox --mailbox /path/to/mailbox --as lead perm revoke kimi-1 broadcast
 ```
 
 ## 工具一览（19 个）
@@ -107,8 +114,13 @@ python -I -B agent-mailbox/scripts/mailbox.py selftest   # 临时目录里走全
 python -I -B tests/test_mailbox.py                       # 单元、并发与回归测试
 python -I -B tests/test_mcp.py                           # MCP 协议测试（真实子进程，经 stdio 通信）
 MCP_SDK_DIR=<目录>/node_modules/@modelcontextprotocol/sdk node tests/sdk_conformance.cjs   # 用官方 MCP SDK 客户端做一致性检查
-python -I -B tools/package.py                            # 打包到 dist/，同一份源码每次打出的包逐字节相同
+python -I -B tests/test_packaging.py                     # Python 包的构建测试（可复现、内容齐全）
+python -I -B tools/package.py                            # skill 压缩包打到 dist/，同一份源码每次打出的包逐字节相同
+python -I -B tools/build_backend.py                      # Python 包（wheel、sdist）打到 dist-py/，同样逐字节可复现
+python -I -B tools/verify_wheel.py dist-py/agent_mailbox_mcp-*.whl   # 在全新虚拟环境里装好后跑一遍
 ```
+
+Python 包由仓库自带的 `tools/build_backend.py` 构建（PEP 517，只用标准库），所以 `pip`、`uv` 从源码或 GitHub 安装时也不需要下载任何构建依赖。
 
 GitHub Actions 会在 Linux、Windows、macOS 上跑以上测试。
 
@@ -119,7 +131,17 @@ GitHub Actions 会在 Linux、Windows、macOS 上跑以上测试。
    - 推 `v<版本号>` 标签；
    - 在 GitHub 的 Actions 页面对 `release` 工作流点 Run workflow（只限默认分支），工作流会按 `VERSION` 自己打标签。
 
-发版工作流（`.github/workflows/release.yml`）会核对版本号、打包、用解出来的包复验，再建 Release 并上传压缩包与 `.sha256`；这一版的标签已存在时，手动运行会停下，不会重复发。
+发版工作流（`.github/workflows/release.yml`）做这些事：
+- 核对版本号；
+- 打 skill 压缩包和 Python 包，各自复验；
+- 建 Release，上传压缩包、`.sha256`、wheel 与 sdist；
+- 这一版的标签已存在时，手动运行会停下，不会重复发。
+
+发布到 PyPI 需要一次性设置：
+1. 在 PyPI 为 `agent-mailbox-mcp` 添加可信发布者（Trusted Publisher）：仓库 `googxi1310328414-afk/agent-mailbox`，工作流 `release.yml`，环境留空。
+2. 在本仓库 Settings → Secrets and variables → Actions → Variables 里，把 `PYPI_PUBLISH` 设为 `true`。
+
+之后每次发版都会同时上传到 PyPI。1.2.0 起的版本若发布时还没开 PyPI，可以之后在它的标签上手动运行 `release` 补传：已有的 Release 会跳过，PyPI 上已有的文件也会跳过。
 
 ## 许可
 

@@ -2,6 +2,30 @@
 
 每一版的说明写在「## 版本号」下面。发版时（推 `v<版本号>` 标签，或在 Actions 页面手动运行 `release` 工作流），发版工作流会把这一节连同压缩包的 SHA-256 作为 Release 说明。
 
+## 1.2.0
+
+一行接入，长期使用也不变慢。
+
+### 新增
+
+- **Python 包 `agent-mailbox-mcp`**：
+  - 不用下载解压、也不用写脚本路径：`uvx agent-mailbox-mcp --mailbox <信箱目录> --as <本方名>` 就能起 MCP 服务。
+  - `pipx install agent-mailbox-mcp` 装好后有 `agent-mailbox-mcp`（MCP 服务）和 `agent-mailbox`（命令行）两个命令，也可以用 `python -m agent_mailbox`。
+  - 发布到 PyPI 之前，也能直接从 GitHub 运行：`uvx --from git+https://github.com/googxi1310328414-afk/agent-mailbox agent-mailbox-mcp …`。
+  - 包里的布局与 skill 目录一致，模板、文档、`install` 命令照常可用；仍然没有任何依赖。
+- **自带打包后端**（`tools/build_backend.py`，只用标准库）：同一份源码每次打出的 wheel 与 sdist 逐字节相同，从 sdist 再打的 wheel 也相同；`tools/verify_wheel.py` 会在全新的虚拟环境里装好后，把命令行、自检和 MCP 握手各跑一遍。
+- **发版**：Release 附件加上 wheel 与 sdist；在 PyPI 配好可信发布、并把仓库变量 `PYPI_PUBLISH` 设为 `true` 后，发版时同时上传到 PyPI。
+
+### 改进
+
+- 通知流与通话记录改为增量读取：文件只是变长了，就只读新增的部分。在 2 万条（2 MB）的通知流上，来一条新通知后再读，从 55 ms 降到约 1 ms。
+- 通知流超过 512 KB 时，把本人看过的旧条目移到 `notify/<名>.archive.jsonl`：没看过的、以及最近 500 条留在原处，序号不变。一直不看的人，最多为他留 1 万条。
+
+### 安装
+
+- `uvx agent-mailbox-mcp --mailbox <信箱目录> --as <本方名> [--init | --join]`，或 `pipx install agent-mailbox-mcp`。
+- 也可以照旧下载 `agent-mailbox-1.2.0.zip`，当 Agent Skill 用，或用 `python -I -B agent-mailbox/scripts/mcp_server.py …` 运行。
+
 ## 1.1.0
 
 把项目完善成一个**独立的 MCP 服务**：
