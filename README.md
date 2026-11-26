@@ -43,7 +43,7 @@
 
    | 方式 | 起服务的命令 |
    |---|---|
-   | [uv](https://docs.astral.sh/uv/)（推荐） | `uvx agent-mailbox-mcp …`；发布到 PyPI 之前用 `uvx --from git+https://github.com/googxi1310328414-afk/agent-mailbox agent-mailbox-mcp …` |
+   | [uv](https://docs.astral.sh/uv/)（推荐） | `uvx agent-mailbox-mcp …`；要用 GitHub 上还没发版的代码，用 `uvx --from git+https://github.com/googxi1310328414-afk/agent-mailbox agent-mailbox-mcp …` |
    | pipx / pip | `pipx install agent-mailbox-mcp` 之后用 `agent-mailbox-mcp …`；命令行是 `agent-mailbox …` |
    | 压缩包 | 下载 [Releases](../../releases) 里的 `agent-mailbox-<版本>.zip` 解压，用 `python -I -B <skill>/scripts/mcp_server.py …`；当 Agent Skill 用也是这个包 |
 

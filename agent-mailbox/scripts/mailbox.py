@@ -30,7 +30,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 SCHEMA = "agent-mailbox/1"
 CONTROL = ".agent-mailbox"
 SKILL_NAME = "agent-mailbox"

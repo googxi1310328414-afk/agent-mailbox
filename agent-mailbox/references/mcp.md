@@ -16,7 +16,8 @@ agent-mailbox-mcp --mailbox <信箱目录> --as <本方名> [选项]            
 python -I -B <skill>/scripts/mcp_server.py --mailbox <信箱目录> --as <本方名> [选项]   # 用 skill 压缩包
 ```
 
-发布到 PyPI 之前，uv 也能直接从 GitHub 取：`uvx --from git+https://github.com/googxi1310328414-afk/agent-mailbox agent-mailbox-mcp …`。
+要用 GitHub 上还没发版的代码，uv 也能直接从 GitHub 取：`uvx --from git+https://github.com/googxi1310328414-afk/agent-mailbox agent-mailbox-mcp …`。
+想知道用的是哪一版：`uvx agent-mailbox-mcp --version`（1.2.1 起）。
 包里没有任何依赖；uv、pip 从源码构建时用的是仓库自带的标准库打包后端，也不用下载构建依赖。
 
 | 选项 | 默认 | 说明 |
@@ -38,6 +39,7 @@ python -I -B <skill>/scripts/mcp_server.py --mailbox <信箱目录> --as <本方
 | `--join`、`--join-role` | 关、`assistant` | 本方不在花名册里（或已不在任）时申请加入，等主控批准 |
 | `--model`、`--harness`、`--note` | 环境变量 `AGENT_MAILBOX_MODEL`、`AGENT_MAILBOX_HARNESS` | `--init`、`--join` 时登记的模型、宿主与附言 |
 | `--token-file` | 无 | 身份令牌文件；也可设环境变量 `AGENT_MAILBOX_TOKEN`（优先） |
+| `--version` | — | 打印版本号后退出，不起服务；输出与 `agent-mailbox --version` 相同 |
 
 同一身份只该有一个监视。用 MCP 时，不要再给同一身份挂命令行 `watch`。
 
