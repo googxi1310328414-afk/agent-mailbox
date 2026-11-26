@@ -434,6 +434,29 @@ class WatchTest(unittest.TestCase):
         self.assertIn('"exit": 0', o)
         self.assertEqual(b.jrun("tasks", "--as", "helper-c")["waits"], [])
 
+    def test_waitfile_waits_until_written(self):
+        b = self.b
+        res = os.path.join(b.dir, "RESULT2.json")
+        self.assertEqual(b.run("tasks", "wait-add", "--as", "helper-c", "--path", res)[0], 0)
+        mb = b.mailbox()
+
+        class A(object):
+            pass
+        w = M.Watcher(mb, mb.get("helper-c"), A())
+        w.st, w.waits = {"waits_fired": {}}, []
+        open(res, "wb").close()  # 刚建好，还没写进内容
+        w.poll_waits()
+        self.assertEqual(w.events, [])
+        self.assertTrue(w.unstable)
+        with open(res, "wb") as f:
+            f.write(b'{"exit": 0}')
+        w.poll_waits()
+        self.assertEqual(w.events, [])  # 大小又变了，再等一轮
+        w.poll_waits()
+        self.assertEqual([e["kind"] for e in w.events], ["WAITFILE"])
+        self.assertEqual(w.events[0]["sub"], ['{"exit": 0}'])
+        self.assertEqual(b.jrun("tasks", "--as", "helper-c")["waits"], [])
+
     def test_reminders(self):
         b = self.b
         b.run("tasks", "set", "T9", "--as", "helper-c", "--status", "open", "--next", "x")

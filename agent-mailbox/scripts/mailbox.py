@@ -3446,13 +3446,22 @@ class Watcher(object):
                     keep.append((path, note, src))
                 continue
             try:
-                mt = os.stat(path).st_mtime
+                st = os.stat(path)
             except OSError:
                 if src != "tasks":
                     keep.append((path, note, src))
                 continue
+            mt = st.st_mtime
             if fired.get(path) == mt:
                 continue
+            # 刚出现、可能还在写的文件先等它稳定（大小一轮不变，或已 2 秒没动），免得报出写了一半的结果
+            if os.path.isfile(path) and time.time() - mt < 2.0 and self.sizes.get(path) != st.st_size:
+                self.sizes[path] = st.st_size
+                self.unstable = True
+                if src != "tasks":
+                    keep.append((path, note, src))
+                continue
+            self.sizes.pop(path, None)
             fired[path] = mt
             sub = []
             if os.path.isfile(path):
