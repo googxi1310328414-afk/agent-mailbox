@@ -15,7 +15,11 @@
 | `.agent-mailbox/tasks/<名>.json` | 任务清单、等待对象、等待文件 | 本人 |
 | `.agent-mailbox/notes/<名>.md` | 续接备忘 | 本人 |
 | `.agent-mailbox/presence/<名>.json` | 监视进程登记（pid、主机、心跳） | 本人的 `watch` |
-| `.agent-mailbox/locks/*.lock` | 编号锁、游标锁、花名册锁（毫秒级持有） | 工具 |
+| `.agent-mailbox/notify/<名>.jsonl` | 通知流：带序号、只追加 | 发通知的一方与系统（持锁追加） |
+| `.agent-mailbox/talk/c<N>.json`、`c<N>.jsonl` | 通话的成员与状态；通话记录（带序号、只追加） | 通话成员（持锁） |
+| `.agent-mailbox/queues/<队列>.json`、`<队列>.archive.jsonl` | 工作队列的设置与任务；结束较久的任务归档 | 投放、领取、管理队列的各方（持锁读改写） |
+| `.agent-mailbox/requests/<名>.json` | 加入申请 | 申请者；主控或 `roster.admin` 审批 |
+| `.agent-mailbox/locks/*.lock` | 编号锁、游标锁、花名册锁、通知锁、通话锁、队列锁（毫秒级持有） | 工具 |
 | `.agent-mailbox/log/sent.jsonl` | 投递日志：时间、发件、收件、文件、SHA-256 | 工具（只追加） |
 | `.agent-mailbox/log/roster.jsonl` | 花名册改动日志 | 工具（只追加） |
 
@@ -121,7 +125,9 @@ to-<箱>-<线程>-<KEY>-STATUS.json        KEY：大写字母数字，可用 - �
 | `policy.broadcast` | 谁能广播：`controller` / `anyone` | `controller` |
 | `policy.inactive_send` | 不在任者能否发信 | `deny` |
 | `secret_patterns` | 追加的凭据正则 | `[]` |
-| `participants[]` | 参与方：`name`、`role`（controller / assistant / former / observer）、`display`、`model`、`harness`、`session`、`box`、`aliases`、`active`、`since`、`until`、`note` | |
+| `presets` | 角色预设的整体改写：`{"assistant": [...], "observer": [...]}`（见第 10 节） | 无（由通信策略推出） |
+| `user_token_sha256` | `--as user` 的身份令牌哈希 | 无 |
+| `participants[]` | 参与方：`name`、`role`（controller / assistant / former / observer）、`display`、`model`、`harness`、`session`、`box`、`aliases`、`active`、`since`、`until`、`note`；`allow`、`deny`（主控的显式授予、收回）；`token_sha256`（身份令牌哈希） | |
 
 校验（不通过就拒绝写入）：恰有一名在任主控；在任助手不超过上限且都有收件箱；名字和别名在在任者之间不重复；个人箱不能与主控箱、广播箱同名。
 
@@ -137,8 +143,13 @@ to-<箱>-<线程>-<KEY>-STATUS.json        KEY：大写字母数字，可用 - �
 6. 状态读写失败绝不当作空文件处理（防止已读记录被清空）。
 7. 监视循环不派生子进程；要等的路径可写在文件里（`--wait-from`），不出现在命令行上。
 8. 交接主控时先备好新旧主控的游标，最后才改花名册，新主控的监视不会把主控箱历史信当新信报。
+9. 通知流、通话记录只追加：序号在锁里取（读最后一条加一），拿不到锁就不写；崩溃留下的残行跳过，下一条另起一行、不重号。
+10. 工作队列的每次改动都在队列锁里整文件读改写（原子替换）；同一任务同一时刻至多一人领着，到期的租约在下一次操作时收回。
+11. 权限改动只经花名册（`perm` 子命令），与其它花名册改动一样校验、加版本号、记日志，并通知本人。
 
-信任模型：身份由 `--as` 自报，工具防的是误操作（写错收件人、覆盖他人的信、两个主控），不防恶意冒充。需要防冒充时，应由目录权限或宿主隔离来保证。
+信任模型：身份由 `--as` 自报，工具防的是误操作（写错收件人、覆盖他人的信、两个主控、越权），不防恶意冒充。
+- 给主控和用户设身份令牌（第 10 节）后，冒用这两个身份要先拿到令牌，模型就没法用 `--as` 绕开权限。
+- 能直接写目录的人仍然能改文件；要防这种情况，靠目录权限或宿主隔离。
 
 ## 9. 与旧工具共存
 
@@ -150,3 +161,87 @@ to-<箱>-<线程>-<KEY>-STATUS.json        KEY：大写字母数字，可用 - �
 | 手写信头时间 | 容易估错 | 由 `send` 投递时现取 |
 
 旧工具不认编号锁，也不管后缀撞号；第 5 节第 5 步的复查能兜住大多数情况，剩下的先后顺序由 `doctor` 发现（见该步说明）。
+
+## 10. 权限与身份令牌
+
+权限写作 `键[:范围]`。
+
+| 键 | 含义 | 范围 |
+|---|---|---|
+| `send` | 写信 | 参与方名、角色组 |
+| `broadcast` | 广播：写信或发通知给全体 | 不分范围 |
+| `notify` | 发通知 | 参与方名、角色组 |
+| `talk` | 通话：发起、邀请、发言 | 参与方名、角色组 |
+| `talk.audit` | 旁听：读任何通话、看别人的来电队列 | 不分范围 |
+| `queue.push`、`queue.take`、`queue.admin` | 投任务、领任务、建队列改设置并代他人处置任务 | 队列名 |
+| `status` | 写状态板 | 不分范围 |
+| `roster.admin` | 代管花名册：增减助手、改他人信息（不含主控）、审批加入申请 | 不分范围 |
+| `*` | 全部 | 不分范围 |
+
+范围写法：
+- 角色组：`@controller`、`@assistants`、`@observers`；
+- 不写或写 `*`：不限。
+
+判定（命令行与 MCP 完全一致）：
+1. 在任主控与用户（`--as user`）永远拥有全部权限；对用户（人）说话总是可以。
+2. 不在任的人什么都不能做；唯一例外是 `policy.inactive_send=allow` 时可以写信。
+3. 看本人的显式条目（`deny` 收回、`allow` 授予），取覆盖本次操作的最具体一条：点名 3 > 角色组 2 > 不限 1；同样具体时收回优先。
+4. 没有显式条目覆盖时，看角色预设。
+
+角色预设：花名册 `presets` 里写了就用它，否则按通信策略推出（与 1.0 行为一致）：
+- 助手：`send`、`notify`、`talk`、`queue.push`、`queue.take`、`status`；
+  - `policy.assistant_to_assistant=deny` 时，`send`、`notify`、`talk` 只对 `@controller`、`@observers`；
+  - `policy.broadcast=anyone` 时加 `broadcast`；
+  - `cc-controller` 不改权限，只让助手之间的信、通知、通话自动带上主控。
+- 旁听者：`talk.audit`。
+- 前任：无。
+
+在通话里发言，要对其中每个在任成员都有 `talk` 权限。邀请别人时，要对被邀请者有 `talk` 权限。
+
+身份令牌：
+- 主控用 `perm token <名字|user>` 生成 `amb_` 开头的 44 位令牌，只显示一次（或写进 `--out` 指定的文件，权限位 600）；花名册里只存它的 SHA-256。
+- 设了令牌的身份，每次以它操作都要出示令牌：环境变量 `AGENT_MAILBOX_TOKEN`，或 `AGENT_MAILBOX_TOKEN_FILE`、`--token-file` 指向的文件。
+- 令牌按凭据规则拦截，不能写进信件、通知、通话。
+- 设了按人权限而主控或用户没有令牌时，`doctor` 会提醒。
+
+## 11. 通知流、通话、工作队列、加入申请
+
+通知流 `notify/<名>.jsonl`，每行一条：
+
+```json
+{"seq": 3, "at": "2026-11-26T10:00:00Z", "from": "lead", "kind": "job", "title": "队列 review", "text": "…", "urgent": false, "ref": {"queue": "review", "job": 7}}
+```
+
+- `kind` 取值：
+  - `note`：有人发的通知；
+  - `job`、`job-done`、`job-failed`：派活、领取、取消，任务完成，任务失败；
+  - `perm`：权限变更；
+  - `join`、`joined`：加入申请，加入已批准。
+- 文字最多 4 KB，经卫生检查与凭据拦截。
+- 收件人游标里的 `notify_seen` 是已看序号：MCP 送达、命令行 `watch` 报出、`notify list` 列出，都把它往前推。
+- 给别人发通知要有 `notify` 权限，发给全体要有 `broadcast`。
+
+通话：
+- `talk/c<N>.json` 记 `id`、`topic`、`created_by`、`state`（open / closed）、`members`。每个成员有 `name`、`since`（加入时的序号，之前的消息不算未读）、`left`。
+- `talk/c<N>.jsonl` 每行一条：`{"seq", "at", "from", "kind", "text", "reply_to", "urgent"}`。`kind` 取 `msg`（发言）、`join`、`leave`、`close`。文字最多 16 KB。
+- 编号 `c<N>` 在 `locks/talk.lock` 里取最大号加一，元数据文件排他创建；发言、邀请、退出、结束在 `locks/talk-c<N>.lock` 里进行。
+- 成员游标里的 `talk_seen` 记每个通话的已看序号，未读就是序号之后、别人发的记录。
+- **来电队列**：有未读发言的进行中通话，紧急的在前，其余按最早一条未读的时间先来后到。`talk next` 取队首并记为已看；呼叫方看到的「排第几位」就是在这个队列里的位置。
+- `talk call` 沿用与对方的一对一通话（按策略抄送主控时允许多一个主控），没有就新建。
+
+工作队列 `queues/<队列>.json`：
+- 设置：`lease_seconds`（默认 900）、`max_attempts`（默认 3）、`consumers`（领取名单，空为不限）、`notify`（新任务是否通知可领的人）。
+- 任务 `jobs[]`：`id`、`title`、`body`、`from`、`priority`、`to`（指派）、`status`（pending / claimed / done / failed / cancelled）、`attempts`、`claimed_by`、`lease_until`、`result`、`error`、`log`。
+- 领取顺序：
+  - 优先级高的先；
+  - 同优先级里指派给自己的先；
+  - 再按 `id`；
+  - 指派给别人的领不到。
+- 领取时 `attempts` 加一。租约到期时还有次数就放回排队，否则判失败并通知投放者。`release` 放回且不算一次尝试，`fail --retry` 还有次数就放回排队。
+- 已结束的任务保留最近 100 个，更早的移到 `<队列>.archive.jsonl`。
+- 排队中的任务最多 500 个；内容与结果各最多 16 KB。
+
+加入申请 `requests/<名>.json`：
+- 字段：`{"name", "model", "harness", "display", "note", "role", "at", "status": "pending|approved|rejected", "decided_by", "decided_at", "reason"}`。
+- 同时待批的申请最多 20 个。重复申请只刷新内容，不重复通知。
+- 批准时按申请加入花名册：已是前任的，重新在任，旧箱里的历史信记为已读。可顺带写 `allow`、`deny`，这一步只有主控能做。

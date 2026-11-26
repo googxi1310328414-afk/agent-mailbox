@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""agent-mailbox：多模型协作信箱命令行（主控唯一，助手可增减）。
+"""agent-mailbox：多模型协作信箱命令行（主控唯一，助手可增减；带通知、通话、工作队列与主控分配的权限）。
 
 只用 Python 标准库（3.8+），Windows / Linux / macOS / WSL 通用；监视循环不派生子进程。
 
@@ -8,6 +8,7 @@
 - 控制目录 <信箱>/.agent-mailbox/ 存花名册 config.json、游标、任务、备忘、在线状态、锁和日志。
 - 投递：编号锁 + open(..., 'xb') 原子排他创建；编号被占就顺延，绝不覆盖；写后读回核 SHA-256。
 - 信头时间由本工具在投递时现取，不靠手写。
+- 通知流、通话记录是带序号的 JSONL，持锁取号追加；工作队列整文件持锁读改写；权限写在花名册里，由主控分配。
 
 协议全文见 ../references/protocol.md，命令详解见 ../references/commands.md。
 """
@@ -16,6 +17,7 @@ import copy
 import datetime as dt
 import glob
 import hashlib
+import hmac
 import json
 import os
 import re
@@ -28,7 +30,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 SCHEMA = "agent-mailbox/1"
 CONTROL = ".agent-mailbox"
 SKILL_NAME = "agent-mailbox"
@@ -104,9 +106,11 @@ SECRET_PATTERNS = [
     r"(?<![A-Za-z0-9])AKIA[0-9A-Z]{16}(?![A-Za-z0-9])",
     r"(?<![A-Za-z0-9])xox[abprs]-[A-Za-z0-9-]{10,}",
     r"eyJ[A-Za-z0-9_-]{10,}\.eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}",
+    r"(?<![A-Za-z0-9])amb_[0-9a-f]{40}(?![0-9a-f])",  # 本工具发的身份令牌
 ]
 RULES = ("处理规则：① 先 read 原信或原件再行动，不凭摘要猜；② 只处理写给本方的事项，点名他人的不碰；"
-         "③ 收到登记或返修先发开工回执；④ 写信只用 send（排他编号、现取时间、读回 SHA）；⑤ 处理完重挂 watch。")
+         "③ 收到登记或返修先发开工回执；④ 写信只用 send（排他编号、现取时间、读回 SHA），通话用 talk say 回复；"
+         "⑤ 处理完重挂 watch。")
 USER = {"name": "user", "role": "user", "display": "用户", "model": "", "harness": "", "session": "",
         "box": "", "aliases": [], "active": True, "since": "", "until": "", "note": ""}
 UTC = dt.timezone.utc
@@ -529,6 +533,13 @@ def norm_participant(p):
     q["active"] = bool(q["active"])
     for k in ("model", "harness", "session", "box", "since", "until", "note"):
         q[k] = str(q.get(k) or "")
+    for k in ("allow", "deny"):
+        v = q.get(k)
+        if v is None:
+            q[k] = []
+        elif isinstance(v, list):
+            q[k] = [str(x).strip() for x in v if str(x).strip()]
+        # 别的类型原样留着，交给 validate_config 报错
     return q
 
 
@@ -620,6 +631,37 @@ def validate_config(cfg):
             if got != (b, th, 1, tag):
                 errors.append("收件箱名 %s 与线程号组合后无法无歧义解析（%s），请换个箱名" % (b, nm))
                 break
+    for p in ps:
+        for k in ("allow", "deny"):
+            v = p.get(k)
+            if v is None:
+                continue
+            if not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+                errors.append("%s 的 %s 须是权限字符串的数组" % (p.get("name"), k))
+                continue
+            bad = [x for x in v if parse_perm(x) is None]
+            if bad:
+                warns.append("%s 的 %s 里有看不懂的权限 %s，已忽略" % (p.get("name"), k, "、".join(map(repr, bad))))
+        tok = p.get("token_sha256")
+        if tok and not re.match(r"^[0-9a-f]{64}$", str(tok)):
+            errors.append("%s 的 token_sha256 须是 64 位小写十六进制" % p.get("name"))
+    utok = cfg.get("user_token_sha256")
+    if utok and not re.match(r"^[0-9a-f]{64}$", str(utok)):
+        errors.append("user_token_sha256 须是 64 位小写十六进制")
+    presets = cfg.get("presets")
+    if presets is not None:
+        if not isinstance(presets, dict):
+            errors.append("presets 须是对象：{\"assistant\": [...], \"observer\": [...]}")
+        else:
+            for role, v in presets.items():
+                if role not in PRESET_ROLES:
+                    errors.append("presets 只能给 %s 设：%r" % (" / ".join(PRESET_ROLES), role))
+                elif not isinstance(v, list) or not all(isinstance(x, str) for x in v):
+                    errors.append("presets.%s 须是权限字符串的数组" % role)
+                else:
+                    bad = [x for x in v if parse_perm(x) is None]
+                    if bad:
+                        warns.append("presets.%s 里有看不懂的权限 %s，已忽略" % (role, "、".join(map(repr, bad))))
     ctrls = [p.get("name") for p in ps if p.get("role") == "controller" and p.get("active")]
     if len(ctrls) != 1:
         errors.append("必须恰有一名在任主控，当前 %d 名：%s" % (len(ctrls), "、".join(ctrls) or "无"))
@@ -627,6 +669,100 @@ def validate_config(cfg):
     if isinstance(mx, int) and mx >= 0 and len(assistants) > mx:
         errors.append("在任助手 %d 名，超过上限 max_assistants=%d" % (len(assistants), mx))
     return errors, warns
+
+
+# ------------------------------------------------------------------ 权限
+# 权限写作「键[:范围]」。范围可以是参与方名、角色组（@controller、@assistants、@observers）或队列名；
+# 不写范围或写 * 表示不限。主控与用户永远拥有全部权限；其余人 = 角色预设 + 主控的显式授予与收回。
+# 判定：显式条目里取最具体的一条（点名 3 > 角色组 2 > 不限 1），同样具体时收回优先；没有显式条目才看角色预设。
+PERM_CATALOG = (
+    ("send", "who", "写信"),
+    ("broadcast", "", "广播：写信或发通知给全体"),
+    ("notify", "who", "发通知"),
+    ("talk", "who", "通话：发起、邀请、发言（发言要对通话里每个在任成员都有）"),
+    ("talk.audit", "", "旁听：读任何通话"),
+    ("queue.push", "queue", "向队列投任务"),
+    ("queue.take", "queue", "从队列领任务"),
+    ("queue.admin", "queue", "建队列、改设置、代他人处置任务"),
+    ("status", "", "写状态板"),
+    ("roster.admin", "", "代管花名册：增减助手、审批加入申请（不含交接主控、改策略和授权）"),
+)
+PERM_SCOPE = dict((k, s) for k, s, _ in PERM_CATALOG)
+PERM_ZH = dict((k, d) for k, _, d in PERM_CATALOG)
+ROLE_SCOPES = {"@controller": "controller", "@assistants": "assistant", "@observers": "observer"}
+PRESET_ROLES = ("assistant", "observer")
+PERM_RE = re.compile(r"^(?P<key>\*|[a-z]+(?:\.[a-z]+)?)(?::(?P<scope>\*|@[a-z]+|[a-z0-9](?:[a-z0-9._-]{0,62}[a-z0-9])?))?$")
+
+
+def parse_perm(s):
+    """把「键[:范围]」拆成（键，范围）；范围 None 表示不限。不合法或不认识返回 None。"""
+    m = PERM_RE.match(str(s or "").strip())
+    if not m:
+        return None
+    key, scope = m.group("key"), m.group("scope")
+    if scope == "*":
+        scope = None
+    if key == "*":
+        return (key, None) if scope is None else None
+    kind = PERM_SCOPE.get(key)
+    if kind is None:
+        return None
+    if scope is None:
+        return key, None
+    if kind == "":
+        return None  # 这类权限不分范围
+    if kind == "queue":
+        return (key, scope) if BOX_RE.match(scope) else None
+    if scope.startswith("@") and scope not in ROLE_SCOPES:
+        return None
+    return key, scope
+
+
+def perm_text(key, scope):
+    return key if scope is None else "%s:%s" % (key, scope)
+
+
+def role_preset(cfg, role):
+    """角色预设。主控可在花名册 presets 里整体改写；没改写时由旧的通信策略推出，与 1.0 的行为一致。"""
+    custom = (cfg.get("presets") or {}).get(role)
+    if isinstance(custom, list):
+        return [str(x) for x in custom]
+    pol = cfg.get("policy") or {}
+    if role == "assistant":
+        if pol.get("assistant_to_assistant") == "deny":
+            out = ["%s:%s" % (k, s) for k in ("send", "notify", "talk") for s in ("@controller", "@observers")]
+        else:
+            out = ["send", "notify", "talk"]
+        out += ["queue.push", "queue.take", "status"]
+        if pol.get("broadcast") == "anyone":
+            out.append("broadcast")
+        return out
+    if role == "observer":
+        return ["talk.audit"]
+    return []
+
+
+def perm_match(entry, key, target):
+    """entry 对（key，target）的具体度：0 不覆盖，1 不限范围，2 角色组，3 点名。
+    target 是参与方（dict）、队列名（str）或 None（不针对任何人：带范围的条目一律不覆盖）。"""
+    pe = parse_perm(entry)
+    if pe is None:
+        return 0
+    k, scope = pe
+    if k != key and k != "*":
+        return 0
+    if scope is None:
+        return 1
+    if target is None:
+        return 0
+    if isinstance(target, dict):
+        if scope == target.get("name"):
+            return 3
+        role = ROLE_SCOPES.get(scope)
+        if role and target.get("role") == role and target.get("active"):
+            return 2
+        return 0
+    return 3 if scope == str(target) else 0
 
 
 class Router(object):
@@ -737,12 +873,34 @@ class Letter(object):
 
 
 # ------------------------------------------------------------------ 信箱
+def env_token():
+    """身份令牌：环境变量 AGENT_MAILBOX_TOKEN，或 AGENT_MAILBOX_TOKEN_FILE 指向的文件（只取第一行）。"""
+    t = (os.environ.get("AGENT_MAILBOX_TOKEN") or "").strip()
+    if t:
+        return t
+    f = os.environ.get("AGENT_MAILBOX_TOKEN_FILE")
+    return read_token_file(f) if f else ""
+
+
+def read_token_file(path):
+    raw = read_bytes_retry(os.path.abspath(os.path.expanduser(path)))
+    if raw is None:
+        raise CliError("找不到令牌文件：%s" % path, 2)
+    lines = raw.decode("utf-8-sig", "replace").strip().splitlines()
+    return lines[0].strip() if lines else ""
+
+
+def token_hash(tok):
+    return hashlib.sha256(str(tok).strip().encode("utf-8")).hexdigest()
+
+
 class Mailbox(object):
-    def __init__(self, root, config_path=None, state_dir=None, read_only=False):
+    def __init__(self, root, config_path=None, state_dir=None, read_only=False, token=None):
         self.root = os.path.abspath(root)
         self.ctl = os.path.abspath(state_dir) if state_dir else os.path.join(self.root, CONTROL)
         self.config_path = os.path.abspath(config_path) if config_path else os.path.join(self.ctl, "config.json")
         self.read_only = bool(read_only)
+        self.token = token
         self._cfg = None
         self._router = None
         self._cache = {}
@@ -830,10 +988,18 @@ class Mailbox(object):
             return v
         return self.get(v)
 
+    def lookup(self, text):
+        """按名称、显示名、别名或角色词「主控」找一个具体的参与方（不收「全体」「全体助手」）。"""
+        v = self.find(text)
+        if isinstance(v, str):
+            raise CliError("这里要写一个具体的参与方，不能是 %s" % text, 2)
+        return v
+
     def identity(self, name, need_active=True):
         if not name:
             raise CliError("没有本方身份：加 --as <参与方名>，或设环境变量 AGENT_MAILBOX_ME", 2)
         if name == "user":
+            self.check_token(USER)
             return USER
         p = self.get(name)
         if p is None:
@@ -846,7 +1012,18 @@ class Mailbox(object):
             raise CliError("花名册里没有 %r。在任参与方：%s" % (name, self.roster_names()), 2)
         if need_active and not p["active"]:
             raise CliError("%s 已不在任（%s）" % (p["name"], ROLE_ZH.get(p["role"], p["role"])), 2)
+        self.check_token(p)
         return p
+
+    def check_token(self, p):
+        """花名册给这个身份设了令牌时，要求调用方出示同一令牌（防止用 --as 冒充主控来绕开权限）。"""
+        want = self.cfg.get("user_token_sha256") if p is USER else p.get("token_sha256")
+        if not want:
+            return
+        tok = self.token if self.token is not None else env_token()
+        if not tok or not hmac.compare_digest(token_hash(tok), str(want)):
+            raise CliError("身份 %s 设有令牌：请用环境变量 AGENT_MAILBOX_TOKEN（或 AGENT_MAILBOX_TOKEN_FILE、--token-file）"
+                           "提供本人的令牌；没有令牌就不能以 %s 的身份操作" % (p["name"], p["name"]), 2)
 
     def require_controller(self, me):
         if me is USER:
@@ -854,6 +1031,74 @@ class Mailbox(object):
         c = self.controller()
         if me["name"] != c["name"]:
             raise CliError("只有主控（%s）或用户（--as user）能做这项操作；你是 %s" % (c["name"], me["name"]), 2)
+
+    # 权限
+    def perm_decide(self, p, key, target=None):
+        """返回（是否允许，依据）。"""
+        if p is USER:
+            return True, "用户"
+        if p["role"] == "controller" and p["active"]:
+            return True, "主控"
+        if isinstance(target, dict) and target.get("name") == "user":
+            return True, "对用户（人）总是可以"
+        pol = self.cfg["policy"]
+        if not p["active"]:
+            ok = key == "send" and pol.get("inactive_send") == "allow"
+            return ok, "不在任（policy.inactive_send=%s）" % pol.get("inactive_send")
+        best = None
+        for entries, deny in ((p.get("deny") or [], True), (p.get("allow") or [], False)):
+            for e in entries:
+                s = perm_match(e, key, target)
+                if s and (best is None or s > best[0] or (s == best[0] and deny and not best[1])):
+                    best = (s, deny, e)
+        if best:
+            return (not best[1]), "主控%s %s" % ("收回" if best[1] else "授予", best[2])
+        for e in role_preset(self.cfg, p["role"]):
+            if perm_match(e, key, target):
+                return True, "%s预设 %s" % (ROLE_ZH.get(p["role"], p["role"]), e)
+        return False, "%s预设里没有" % ROLE_ZH.get(p["role"], p["role"])
+
+    def can(self, p, key, target=None):
+        return self.perm_decide(p, key, target)[0]
+
+    def perm_error(self, p, key, target=None, why=None):
+        why = why or self.perm_decide(p, key, target)[1]
+        if isinstance(target, dict):
+            tname, want = target["name"], "%s:%s" % (key, target["name"])
+        elif target:
+            tname, want = "队列 %s" % target, "%s:%s" % (key, target)
+        else:
+            tname, want = "", key
+        msg = "权限不足：%s 不能%s用 %s（%s，%s）" % (
+            p["name"], ("对 %s " % tname) if tname else "", key, PERM_ZH.get(key, key), why)
+        pol = self.cfg["policy"]
+        if (key in ("send", "notify", "talk") and isinstance(target, dict) and target.get("role") == "assistant"
+                and p.get("role") == "assistant" and "预设" in why and pol.get("assistant_to_assistant") == "deny"):
+            msg += "；按策略助手之间不直接通信（policy.assistant_to_assistant=deny），请经主控转达"
+        if key == "broadcast" and "预设" in why and pol.get("broadcast") == "controller":
+            msg += "；按策略只有主控能广播（policy.broadcast=controller）"
+        return CliError(msg + "；确有需要请主控执行 perm grant %s %s" % (p["name"], want), 2)
+
+    def require_perm(self, p, key, target=None):
+        ok, why = self.perm_decide(p, key, target)
+        if not ok:
+            raise self.perm_error(p, key, target, why)
+
+    def require_roster_admin(self, me):
+        if me is USER or (me["role"] == "controller" and me["active"]):
+            return
+        if not self.can(me, "roster.admin"):
+            c = self.controller()
+            raise CliError("只有主控（%s）、用户（--as user）或有 roster.admin 权限的人能改花名册；你是 %s" % (
+                c["name"], me["name"]), 2)
+
+    def perm_summary(self, p):
+        """（预设，显式授予，显式收回）三个列表，供展示。"""
+        if p is USER or (p["role"] == "controller" and p["active"]):
+            return ["*"], [], []
+        if not p["active"]:
+            return (["send"] if self.cfg["policy"].get("inactive_send") == "allow" else []), [], []
+        return role_preset(self.cfg, p["role"]), list(p.get("allow") or []), list(p.get("deny") or [])
 
     def boxes_of(self, p):
         if p is USER:
@@ -1267,6 +1512,638 @@ class Presence(object):
             pass
 
 
+def presence_online(mb, name):
+    pres = load_json_quiet(mb.p("presence", name + ".json")) or {}
+    beat = ts_of(pres.get("beat"))
+    return bool(beat and not pres.get("stopped") and time.time() - beat < 3 * Presence.BEAT)
+
+
+# ------------------------------------------------------------------ 带序号的追加日志（通知流、通话记录共用）
+def _last_seq(chunk):
+    for raw in reversed(chunk.split(b"\n")):
+        if not raw.strip():
+            continue
+        try:
+            e = json.loads(raw.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            continue  # 崩溃留下的残行
+        if isinstance(e, dict) and isinstance(e.get("seq"), int) and not isinstance(e.get("seq"), bool):
+            return e["seq"]
+    return None
+
+
+def jsonl_tail_seq(path):
+    """最后一条记录的序号，以及文件是否以换行结尾。只读末尾 64 KB，找不到再读全文。"""
+    try:
+        f = open(path, "rb")
+    except FileNotFoundError:
+        return 0, True
+    with f:
+        f.seek(0, 2)
+        size = f.tell()
+        if size == 0:
+            return 0, True
+        back = min(size, 65536)
+        f.seek(size - back)
+        chunk = f.read(back)
+        seq = _last_seq(chunk)
+        if seq is None and back < size:
+            f.seek(0)
+            seq = _last_seq(f.read())
+    return (seq or 0), chunk.endswith(b"\n")
+
+
+def append_seq(path, make):
+    """（调用方已持锁）取下一个序号并追加一行；make(seq) 返回记录。"""
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    last, ends = jsonl_tail_seq(path)
+    rec = make(last + 1)
+    data = (json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8")
+    if not ends:
+        data = b"\n" + data  # 上次写到一半崩溃留下的残行，不和本行粘在一起
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0), 0o644)
+    try:
+        while data:
+            data = data[os.write(fd, data):]
+    finally:
+        os.close(fd)
+    return rec
+
+
+def jsonl_append(mb, lockname, path, make):
+    """持锁取下一个序号并追加一行。拿不到锁就报错，绝不无锁取号。"""
+    mb.require_writable()
+    with FileLock(mb.p("locks", lockname)):
+        return append_seq(path, make)
+
+
+_FILE_CACHE = {}
+_FILE_CACHE_LOCK = threading.Lock()
+
+
+def cached_load(path, loader):
+    """按（大小，修改时间）缓存文件解析结果；监视循环、MCP 每秒都会查，文件没变就不重读。"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        with _FILE_CACHE_LOCK:
+            _FILE_CACHE.pop(path, None)
+        return None
+    key = (st.st_size, st.st_mtime_ns)
+    with _FILE_CACHE_LOCK:
+        hit = _FILE_CACHE.get(path)
+    if hit and hit[0] == key:
+        return hit[1]
+    val = loader(path)
+    with _FILE_CACHE_LOCK:
+        if len(_FILE_CACHE) > 2000:
+            _FILE_CACHE.clear()
+        _FILE_CACHE[path] = (key, val)
+    return val
+
+
+def jsonl_read(path, after=0):
+    """读出序号大于 after 的记录（按序号）；看不懂的行、残行跳过，同号只取第一条。"""
+    raw = read_bytes_retry(path)
+    if raw is None:
+        return []
+    out, seen = [], set()
+    for line in raw.split(b"\n"):
+        if not line.strip():
+            continue
+        try:
+            e = json.loads(line.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            continue
+        if not isinstance(e, dict) or not isinstance(e.get("seq"), int) or isinstance(e.get("seq"), bool):
+            continue
+        if e["seq"] > after and e["seq"] not in seen:
+            seen.add(e["seq"])
+            out.append(e)
+    out.sort(key=lambda e: e["seq"])
+    return out
+
+
+def check_text(text, what, limit, allow_secret=False, extra=None):
+    """通知、通话、队列里的文字：UTF-8、换行统一为 LF、无损坏字、不超长、不含疑似凭据。"""
+    text = hygiene(text.encode("utf-8") if isinstance(text, str) else text, True).strip("\n")
+    if not text.strip():
+        raise CliError("%s不能为空" % what, 2)
+    n = len(text.encode("utf-8"))
+    if n > limit:
+        raise CliError("%s %d 字节，超过上限 %d；长内容请写信（send）或附文件路径" % (what, n, limit), 2)
+    if not allow_secret:
+        hits = scan_secrets(text, extra)
+        if hits:
+            raise CliError("%s里疑似有凭据（第 %s 行），拒收；确认不是凭据可加 --allow-secret" % (
+                what, "、".join(str(h[0]) for h in hits[:10])), 2)
+    return text
+
+
+# ------------------------------------------------------------------ 通知
+NOTIFY_MAX = 4096
+
+
+def feed_path(mb, name):
+    return mb.p("notify", name + ".jsonl")
+
+
+def notify_push(mb, name, kind, text, frm="", title="", urgent=False, ref=None):
+    def make(seq):
+        rec = {"seq": seq, "at": iso_utc(), "from": frm, "kind": kind, "title": clip(title, 200), "text": text,
+               "urgent": bool(urgent)}
+        if ref:
+            rec["ref"] = ref
+        return rec
+    return jsonl_append(mb, "notify-%s.lock" % name, feed_path(mb, name), make)
+
+
+def notify_system(mb, names, kind, text, frm="", title="", urgent=False, ref=None):
+    """系统通知尽力而为：写不进去只在标准错误提示，不让主操作失败。"""
+    done = []
+    for n in dict.fromkeys(x for x in names if x and x != "user"):
+        try:
+            notify_push(mb, n, kind, clip(text, NOTIFY_MAX), frm, title, urgent, ref)
+            done.append(n)
+        except (CliError, OSError) as e:
+            warn("（给 %s 的通知没写进去：%s）" % (n, str(e).split("\n")[0]))
+    return done
+
+
+def advance_seen(mb, name, notify=None, talk=None):
+    """把通知流、通话的「已看」指针往前推（只增不减）。"""
+    if mb.read_only or (notify is None and not talk):
+        return
+
+    def fn(d):
+        if notify is not None:
+            d["notify_seen"] = max(int(d.get("notify_seen") or 0), int(notify))
+        if talk:
+            ts = dict(d.get("talk_seen") or {})
+            for k, v in talk.items():
+                ts[k] = max(int(ts.get(k) or 0), int(v))
+            d["talk_seen"] = ts
+    mb.update_cursor(name, fn)
+
+
+def seen_pointers(mb, name):
+    """（通知已看序号，{通话: 已看序号}）。"""
+    cur = load_json_quiet(mb.cursor_path(name)) or {}
+    return int(cur.get("notify_seen") or 0), dict((k, int(v or 0)) for k, v in (cur.get("talk_seen") or {}).items())
+
+
+def notify_unseen(mb, name, seen=None):
+    if seen is None:
+        seen = seen_pointers(mb, name)[0]
+    return [e for e in (cached_load(feed_path(mb, name), jsonl_read) or []) if e["seq"] > seen]
+
+
+def iso_at(epoch):
+    return iso_utc(dt.datetime.fromtimestamp(epoch, UTC))
+
+
+def poll_until(seconds, fn, interval=0.5):
+    """每隔 interval 秒调一次 fn，直到它返回真值或超时（返回 None）。"""
+    deadline = time.time() + max(0.0, float(seconds or 0))
+    while True:
+        r = fn()
+        if r:
+            return r
+        left = deadline - time.time()
+        if left <= 0:
+            return None
+        time.sleep(min(interval, max(0.05, left)))
+
+
+def resolve_people(mb, me, spec, what):
+    """把「a,b、controller、assistants、all」展开成在任参与方（不含自己）；返回（名单，是否含全体）。"""
+    tos = [x.strip() for x in re.split(r"[,，、]", spec or "") if x.strip()]
+    if not tos:
+        raise CliError("%s需要 --to 收件人" % what, 2)
+    out, everyone = [], False
+    mine = "" if me is USER else me["name"]
+    for t in tos:
+        v = mb.find(t)
+        if v == "@all":
+            everyone = True
+            out += [p for p in mb.participants(True) if p["name"] != mine]
+        elif v == "@assistants":
+            out += [p for p in mb.participants(True) if p["role"] == "assistant" and p["name"] != mine]
+        else:
+            if v["name"] == mine:
+                raise CliError("不能给自己发%s" % what, 2)
+            if not v["active"]:
+                raise CliError("%s 已不在任" % v["name"], 2)
+            out.append(v)
+    uniq = list(dict((p["name"], p) for p in out).values())
+    if not uniq:
+        raise CliError("没有可发的对象（展开后为空）", 2)
+    return uniq, everyone
+
+
+def cc_controller(mb, me, people):
+    """policy.assistant_to_assistant=cc-controller 时，助手之间的往来自动带上主控。"""
+    if me is USER or me["role"] != "assistant" or mb.cfg["policy"].get("assistant_to_assistant") != "cc-controller":
+        return None
+    if not any(p["role"] == "assistant" for p in people):
+        return None
+    c = mb.controller()
+    return None if any(p["name"] == c["name"] for p in people) else c
+
+
+# ------------------------------------------------------------------ 通话
+TALK_SCHEMA = "agent-mailbox/talk/1"
+TALK_MAX = 16384
+TALK_ID_RE = re.compile(r"^c([1-9][0-9]{0,8})$")
+
+
+def talk_meta_path(mb, cid):
+    return mb.p("talk", cid + ".json")
+
+
+def talk_log_path(mb, cid):
+    return mb.p("talk", cid + ".jsonl")
+
+
+def norm_conv(ref):
+    s = str(ref or "").strip().lower()
+    if re.match(r"^[0-9]+$", s):
+        s = "c%d" % int(s)
+    if not TALK_ID_RE.match(s):
+        raise CliError("看不懂的通话编号 %r（形如 c12，也可只写 12）" % (ref,), 2)
+    return s
+
+
+def talk_ids(mb):
+    try:
+        names = os.listdir(mb.p("talk"))
+    except OSError:
+        return []
+    out = []
+    for n in names:
+        m = TALK_ID_RE.match(n[:-5]) if n.endswith(".json") else None
+        if m:
+            out.append((int(m.group(1)), n[:-5]))
+    return [c for _, c in sorted(out)]
+
+
+def talk_meta(mb, cid, fresh=False):
+    path = talk_meta_path(mb, cid)
+    return read_json_strict(path) if fresh else cached_load(path, read_json_strict)
+
+
+def talk_log(mb, cid, fresh=False):
+    path = talk_log_path(mb, cid)
+    return jsonl_read(path) if fresh else (cached_load(path, jsonl_read) or [])
+
+
+def talk_member(meta, name):
+    for m in meta.get("members") or []:
+        if m.get("name") == name:
+            return m
+    return None
+
+
+def talk_in(meta, name):
+    m = talk_member(meta, name)
+    return bool(m and not m.get("left"))
+
+
+def talk_people(mb, meta, but=None):
+    """通话里在任、没退出的成员（参与方 dict；用户以 USER 表示）。"""
+    out = []
+    for m in meta.get("members") or []:
+        if m.get("left") or m.get("name") == but:
+            continue
+        p = USER if m.get("name") == "user" else mb.get(m.get("name"))
+        if p and p["active"]:
+            out.append(p)
+    return out
+
+
+def talk_brief(meta):
+    return {"id": meta["id"], "topic": meta.get("topic") or "", "state": meta.get("state") or "open",
+            "created_by": meta.get("created_by") or "", "created_at": meta.get("created_at") or "",
+            "members": [m["name"] for m in meta.get("members") or [] if not m.get("left")],
+            "left": [m["name"] for m in meta.get("members") or [] if m.get("left")]}
+
+
+def talk_mine(mb, name, closed=True):
+    out = []
+    for cid in talk_ids(mb):
+        try:
+            meta = talk_meta(mb, cid)
+        except CliError:
+            continue
+        if meta and talk_in(meta, name) and (closed or meta.get("state") == "open"):
+            out.append(meta)
+    return out
+
+
+def talk_unread(mb, name, meta, seen):
+    """name 在这个通话里还没看过的、别人发的记录（含邀请、退出、结束等系统记录）。"""
+    m = talk_member(meta, name)
+    if not m or m.get("left"):
+        return []
+    base = max(int(m.get("since") or 0), int(seen.get(meta["id"]) or 0))
+    return [x for x in talk_log(mb, meta["id"]) if x["seq"] > base and x.get("from") != name]
+
+
+def talk_queue(mb, name, seen=None):
+    """name 的来电队列：有未读消息的进行中通话；紧急的在前，其余按最早一条未读消息先来后到。"""
+    if seen is None:
+        seen = seen_pointers(mb, name)[1]
+    rows = []
+    for meta in talk_mine(mb, name, closed=False):
+        un = [x for x in talk_unread(mb, name, meta, seen) if x.get("kind", "msg") == "msg"]
+        if un:
+            rows.append({"conv": meta["id"], "topic": meta.get("topic") or "", "from": un[0].get("from") or "",
+                         "since": un[0].get("at") or "", "count": len(un), "urgent": any(x.get("urgent") for x in un),
+                         "first_seq": un[0]["seq"]})
+    rows.sort(key=lambda r: (not r["urgent"], ts_of(r["since"]) or 0, int(r["conv"][1:])))
+    return rows
+
+
+def talk_create(mb, me, people, topic):
+    mb.require_writable()
+    os.makedirs(mb.p("talk"), exist_ok=True)
+    now = iso_utc()
+    members = [{"name": x, "since": 0, "at": now} for x in dict.fromkeys([me["name"]] + [p["name"] for p in people])]
+    with FileLock(mb.p("locks", "talk.lock")):
+        ids = talk_ids(mb)
+        n = int(ids[-1][1:]) + 1 if ids else 1
+        for _ in range(50):
+            cid = "c%d" % n
+            meta = {"schema": TALK_SCHEMA, "id": cid, "topic": clip(topic, 200), "created_by": me["name"],
+                    "created_at": now, "state": "open", "members": members}
+            try:
+                with open(talk_meta_path(mb, cid), "xb") as f:
+                    f.write(dump_json(meta))
+            except FileExistsError:
+                n += 1
+                continue
+            return meta
+    raise CliError("连试 50 个通话编号都被占用，没有建成")
+
+
+def _talk_record(me, kind, text, **extra):
+    def make(seq):
+        rec = {"seq": seq, "at": iso_utc(), "from": me["name"], "kind": kind, "text": text}
+        rec.update((k, v) for k, v in extra.items() if v)
+        return rec
+    return make
+
+
+def talk_post(mb, me, cid, text, reply_to=0, urgent=False):
+    """在通话里发言：须是成员（主控、用户会自动加入）；对其中每个在任成员都要有 talk 权限。"""
+    mb.require_writable()
+    with FileLock(mb.p("locks", "talk-%s.lock" % cid)):
+        meta = talk_meta(mb, cid, fresh=True)
+        if meta is None:
+            raise CliError("没有通话 %s（talk list 查看）" % cid, 2)
+        if meta.get("state") != "open":
+            raise CliError("通话 %s 已结束（%s 于 %s）；要继续请另起一个" % (cid, meta.get("closed_by"), meta.get("closed_at")), 2)
+        log = talk_log_path(mb, cid)
+        if not talk_in(meta, me["name"]):
+            if not (me is USER or (me["role"] == "controller" and me["active"])):
+                raise CliError("你不在通话 %s 里；请成员用 talk invite 邀请你" % cid, 2)
+            _talk_join(meta, [me["name"]], jsonl_tail_seq(log)[0])
+            atomic_write(talk_meta_path(mb, cid), dump_json(meta))
+            append_seq(log, _talk_record(me, "join", "%s 加入通话" % me["name"], who=[me["name"]]))
+        for t in talk_people(mb, meta, but=me["name"]):
+            mb.require_perm(me, "talk", t)
+        if reply_to:
+            if not any(x["seq"] == reply_to for x in jsonl_read(log)):
+                raise CliError("通话 %s 里没有第 %d 条" % (cid, reply_to), 2)
+        rec = append_seq(log, _talk_record(me, "msg", text, reply_to=reply_to, urgent=bool(urgent)))
+    return rec, meta
+
+
+def _talk_join(meta, names, last_seq):
+    now = iso_utc()
+    for n in names:
+        m = talk_member(meta, n)
+        if m is None:
+            meta.setdefault("members", []).append({"name": n, "since": last_seq, "at": now})
+        elif m.get("left"):
+            m.update(left=False, since=last_seq, at=now)
+            m.pop("left_at", None)
+
+
+def talk_change(mb, me, cid, op, people=None, cc=None):
+    """邀请（invite）、退出（leave）、结束（close）。"""
+    mb.require_writable()
+    with FileLock(mb.p("locks", "talk-%s.lock" % cid)):
+        meta = talk_meta(mb, cid, fresh=True)
+        if meta is None:
+            raise CliError("没有通话 %s" % cid, 2)
+        boss = me is USER or (me["role"] == "controller" and me["active"])
+        if op != "close" and meta.get("state") != "open":
+            raise CliError("通话 %s 已结束" % cid, 2)
+        log = talk_log_path(mb, cid)
+        last = jsonl_tail_seq(log)[0]
+        if op == "invite":
+            if not talk_in(meta, me["name"]) and not boss:
+                raise CliError("你不在通话 %s 里，不能邀请别人" % cid, 2)
+            new = [p for p in people if not talk_in(meta, p["name"])]
+            for p in new:
+                mb.require_perm(me, "talk", p)
+            if cc is not None and not talk_in(meta, cc["name"]):
+                new.append(cc)
+            if not new:
+                raise CliError("他们都已在通话 %s 里" % cid, 2)
+            names = [p["name"] for p in new]
+            _talk_join(meta, names, last)
+            text = "%s 邀请 %s 加入通话" % (me["name"], "、".join(names))
+            rec = dict(kind="join", text=text, who=names)
+        elif op == "leave":
+            m = talk_member(meta, me["name"])
+            if not m or m.get("left"):
+                raise CliError("你不在通话 %s 里" % cid, 2)
+            m.update(left=True, left_at=iso_utc())
+            rec = dict(kind="leave", text="%s 退出通话" % me["name"])
+        else:
+            if meta.get("state") != "open":
+                raise CliError("通话 %s 已经结束" % cid, 2)
+            if not boss and meta.get("created_by") != me["name"]:
+                raise CliError("只有发起人（%s）或主控能结束通话 %s" % (meta.get("created_by"), cid), 2)
+            meta.update(state="closed", closed_by=me["name"], closed_at=iso_utc())
+            rec = dict(kind="close", text="%s 结束了通话" % me["name"])
+        atomic_write(talk_meta_path(mb, cid), dump_json(meta))
+        kind, text = rec.pop("kind"), rec.pop("text")
+        out = append_seq(log, _talk_record(me, kind, text, **rec))
+    return out, meta
+
+
+def talk_find_pair(mb, me, other, cc=None):
+    """最近一个只有本方与 other 两人（按策略可再带上抄送的主控）、仍在进行的通话。"""
+    want = set([me["name"], other["name"]] + ([cc["name"]] if cc else []))
+    best = None
+    for meta in talk_mine(mb, me["name"], closed=False):
+        names = set(m["name"] for m in meta.get("members") or [] if not m.get("left"))
+        if names == want:
+            best = meta
+    return best
+
+
+def talk_replies(mb, me, cid, after):
+    return [x for x in talk_log(mb, cid, fresh=True) if x["seq"] > after and x.get("from") != me["name"]]
+
+
+# ------------------------------------------------------------------ 队列
+QUEUE_SCHEMA = "agent-mailbox/queue/1"
+QUEUE_MAX_PENDING = 500
+QUEUE_KEEP_DONE = 100
+JOB_MAX = 16384
+JOB_FINAL = ("done", "failed", "cancelled")
+JOB_ZH = {"pending": "排队", "claimed": "已领", "done": "完成", "failed": "失败", "cancelled": "已取消"}
+
+
+def queue_path(mb, name):
+    return mb.p("queues", name + ".json")
+
+
+def check_queue_name(name):
+    if not BOX_RE.match(name or "") or len(name) > 64:
+        raise CliError("队列名须是小写字母数字，可用 - 连接（如 review、build-2）：%r" % (name,), 2)
+    return name
+
+
+def queue_names(mb):
+    try:
+        names = os.listdir(mb.p("queues"))
+    except OSError:
+        return []
+    return sorted(n[:-5] for n in names if n.endswith(".json") and BOX_RE.match(n[:-5]))
+
+
+def job_order(j):
+    return (-int(j.get("priority") or 0), int(j["id"]))
+
+
+def job_log(j, event, who, detail=""):
+    j.setdefault("log", []).append([iso_utc(), event, who, clip(detail, 200)])
+    del j["log"][:-20]
+
+
+def queue_pending(q):
+    return sorted([j for j in q["jobs"] if j["status"] == "pending"], key=job_order)
+
+
+def queue_position(q, job_id):
+    for i, j in enumerate(queue_pending(q)):
+        if j["id"] == job_id:
+            return i + 1
+    return 0
+
+
+def queue_expire(q, now, notes):
+    """租约到期的任务：还有尝试次数就放回排队，否则记为失败并通知投放者。"""
+    for j in q["jobs"]:
+        if j["status"] != "claimed" or (ts_of(j.get("lease_until")) or 0) >= now:
+            continue
+        who = j.get("claimed_by") or "?"
+        if int(j.get("attempts") or 0) >= int(q.get("max_attempts") or 1):
+            j.update(status="failed", finished_at=iso_at(now), finished_by="",
+                     error="租约到期：%s 没在期限内完成，已用完 %d 次尝试" % (who, int(q.get("max_attempts") or 1)))
+            job_log(j, "expired-failed", who)
+            notes.append(([j.get("from")], "job-failed", "队列 %s 的任务 #%d「%s」失败：%s" % (
+                q["name"], j["id"], j.get("title"), j["error"]), {"queue": q["name"], "job": j["id"]}))
+        else:
+            j.update(status="pending", claimed_by="", claimed_at="", lease_until="")
+            job_log(j, "expired", who, "租约到期，放回排队")
+
+
+def queue_prune(mb, q):
+    done = sorted([j for j in q["jobs"] if j["status"] in JOB_FINAL], key=lambda j: (j.get("finished_at") or "", j["id"]))
+    extra = done[:-QUEUE_KEEP_DONE] if len(done) > QUEUE_KEEP_DONE else []
+    if not extra:
+        return
+    ids = set(j["id"] for j in extra)
+    for j in extra:
+        try:
+            append_line(mb.p("queues", q["name"] + ".archive.jsonl"), j)
+        except OSError:
+            pass
+    q["jobs"] = [j for j in q["jobs"] if j["id"] not in ids]
+
+
+def queue_view(mb, name):
+    """只读查看：实时算出租约到期后的样子，但不写回（下次有人操作这个队列时才真正收回）。"""
+    q = read_json_strict(queue_path(mb, name))
+    if q is None:
+        raise CliError("没有队列 %s（queue list 查看）" % name, 2)
+    q = copy.deepcopy(q)
+    queue_expire(q, time.time(), [])
+    return q
+
+
+def queue_edit(mb, name, fn, create=None, actor=""):
+    """持队列锁读改写。fn(q, notes) 的返回值原样返回；notes 里攒的通知在放锁之后才发。"""
+    mb.require_writable()
+    path = queue_path(mb, name)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    notes = []
+    with FileLock(mb.p("locks", "queue-%s.lock" % name)):
+        q = read_json_strict(path)
+        if q is None:
+            if create is None:
+                raise CliError("没有队列 %s（queue list 查看；主控或有 queue.admin 权限的人可 queue create）" % name, 2)
+            q = create()
+        queue_expire(q, time.time(), notes)
+        res = fn(q, notes)
+        queue_prune(mb, q)
+        q["updated_at"] = iso_utc()
+        atomic_write(path, dump_json(q))
+    for names, kind, text, ref in notes:
+        notify_system(mb, [n for n in names if n and n != actor], kind, text, actor or "", "队列 " + name, ref=ref)
+    return res, q
+
+
+def queue_new(name, me, desc="", lease=900, max_attempts=3, consumers=None, notify=True):
+    return {"schema": QUEUE_SCHEMA, "name": name, "desc": clip(desc, 300), "created_by": me["name"],
+            "created_at": iso_utc(), "lease_seconds": int(lease), "max_attempts": int(max_attempts),
+            "consumers": list(consumers or []), "notify": bool(notify), "seq": 0, "jobs": []}
+
+
+def queue_job(q, job_id):
+    for j in q["jobs"]:
+        if j["id"] == job_id:
+            return j
+    raise CliError("队列 %s 里没有任务 #%d（完成太久的会移到归档）" % (q["name"], job_id), 2)
+
+
+def queue_consumers(mb, q, me):
+    """新任务通知谁：队列登记的领取名单；没登记就是有领取权限的在任助手与旁听者（不含主控、投放者本人）。"""
+    if q.get("consumers"):
+        return [n for n in q["consumers"] if mb.get(n) and mb.get(n)["active"]]
+    return [p["name"] for p in mb.participants(True)
+            if p["role"] != "controller" and p["name"] != me["name"] and mb.can(p, "queue.take", q["name"])]
+
+
+# ------------------------------------------------------------------ 加入申请
+REQ_MAX_PENDING = 20
+
+
+def request_path(mb, name):
+    return mb.p("requests", name + ".json")
+
+
+def requests_all(mb):
+    try:
+        names = sorted(os.listdir(mb.p("requests")))
+    except OSError:
+        return []
+    out = []
+    for n in names:
+        if n.endswith(".json") and NAME_RE.match(n[:-5]):
+            d = load_json_quiet(mb.p("requests", n))
+            if isinstance(d, dict):
+                out.append(d)
+    out.sort(key=lambda d: (d.get("at") or "", d.get("name") or ""))
+    return out
+
+
 # ------------------------------------------------------------------ 命令公共
 def resolve_mailbox_dir(a):
     d = a.mailbox or os.environ.get("AGENT_MAILBOX_DIR")
@@ -1282,7 +2159,8 @@ def open_mb(a, need_config=True):
     root = resolve_mailbox_dir(a)
     if not os.path.isdir(root):
         raise CliError("信箱目录不存在：%s" % root, 2)
-    mb = Mailbox(root, a.config, a.state_dir, a.read_only)
+    mb = Mailbox(root, a.config, a.state_dir, a.read_only,
+                 token=read_token_file(a.token_file) if getattr(a, "token_file", None) else None)
     if need_config:
         mb.cfg  # 尽早校验花名册
     return mb
@@ -1450,7 +2328,9 @@ def roster_rows(mb):
         rows.append({"name": p["name"], "role": p["role"], "active": p["active"], "display": p["display"],
                      "model": p["model"], "harness": p["harness"], "session": p["session"],
                      "inbox": mb.boxes_of(p) if p["active"] else ([p["box"]] if p["box"] else []),
-                     "aliases": p["aliases"], "since": p["since"], "until": p["until"], "note": p["note"]})
+                     "aliases": p["aliases"], "since": p["since"], "until": p["until"], "note": p["note"],
+                     "allow": list(p.get("allow") or []), "deny": list(p.get("deny") or []),
+                     "token": bool(p.get("token_sha256"))})
     return rows
 
 
@@ -1461,17 +2341,21 @@ def cmd_roster_show(a):
     if a.json:
         emit_json({"thread": cfg["thread"], "revision": cfg.get("revision"), "controller_box": cfg["controller_box"],
                    "broadcast_box": cfg["broadcast_box"], "max_assistants": cfg["max_assistants"],
-                   "policy": cfg["policy"], "participants": rows, "warnings": mb.config_warnings})
+                   "policy": cfg["policy"], "presets": dict((r, role_preset(cfg, r)) for r in PRESET_ROLES),
+                   "user_token": bool(cfg.get("user_token_sha256")), "participants": rows,
+                   "warnings": mb.config_warnings})
         return 0
     act = [r for r in rows if r["role"] == "assistant" and r["active"]]
     emit("信箱 %s｜线程 %s｜花名册第 %s 版｜主控箱 %s｜广播箱 %s｜在任助手 %d/%d" % (
         slash(mb.root), cfg["thread"] or "（无）", cfg.get("revision"), cfg["controller_box"],
         cfg["broadcast_box"], len(act), cfg["max_assistants"]))
     for r in sorted(rows, key=lambda r: (not r["active"], ROLES.index(r["role"]) if r["role"] in ROLES else 9)):
-        emit("  %s %-18s %-4s  %s / %s%s  收件箱 %s%s" % (
+        perms = " ".join(["+" + x for x in r["allow"]] + ["-" + x for x in r["deny"]])
+        emit("  %s %-18s %-4s  %s / %s%s  收件箱 %s%s%s%s" % (
             "●" if r["active"] else "○", r["name"], ROLE_ZH.get(r["role"], r["role"]), r["model"] or "-",
             r["harness"] or "-", ("  会话 " + r["session"]) if r["session"] else "",
-            ",".join(r["inbox"]) or "-", ("  别名 " + "、".join(r["aliases"])) if r["aliases"] else ""))
+            ",".join(r["inbox"]) or "-", ("  别名 " + "、".join(r["aliases"])) if r["aliases"] else "",
+            ("  权限 " + perms) if perms else "", "  [令牌]" if r["token"] else ""))
     for w in mb.config_warnings:
         emit("  注意：" + w)
     return 0
@@ -1484,7 +2368,7 @@ def default_box(name):
 def cmd_roster_add(a):
     mb = open_mb(a)
     me = mb.identity(a.me or "")
-    mb.require_controller(me)
+    mb.require_roster_admin(me)
     if a.role == "controller":
         raise CliError("新参与方不能直接设为主控：先 add 为助手，再 roster handover", 2)
 
@@ -1517,7 +2401,10 @@ def cmd_roster_update(a):
     if not asked:
         raise CliError("没有要改的字段", 2)
     if not (me is not USER and me["name"] == a.name and asked <= self_fields):
-        mb.require_controller(me)
+        if target["role"] == "controller" and target["active"]:
+            mb.require_controller(me)  # 代管花名册的人不能改主控
+        else:
+            mb.require_roster_admin(me)
 
     def fn(cfg):
         p = [x for x in cfg["participants"] if x["name"] == a.name][0]
@@ -1553,7 +2440,7 @@ def cmd_roster_update(a):
 def cmd_roster_remove(a):
     mb = open_mb(a)
     me = mb.identity(a.me or "")
-    mb.require_controller(me)
+    mb.require_roster_admin(me)
     t = mb.get(a.name)
     if t is None:
         raise CliError("花名册里没有 %s" % a.name, 2)
@@ -1577,7 +2464,7 @@ def cmd_roster_remove(a):
 def cmd_roster_limit(a):
     mb = open_mb(a)
     me = mb.identity(a.me or "")
-    mb.require_controller(me)
+    mb.require_roster_admin(me)
 
     def fn(cfg):
         cfg["max_assistants"] = a.n
@@ -1666,6 +2553,231 @@ def cmd_roster_handover(a):
     return 0
 
 
+# ------------------------------------------------------------------ 权限命令
+SCOPE_ZH = {"who": "参与方或角色组", "queue": "队列", "": "不分范围"}
+
+
+def perm_row(mb, p):
+    preset, allow, deny = mb.perm_summary(p)
+    return {"name": p["name"], "role": p["role"], "active": p["active"], "preset": preset, "allow": allow,
+            "deny": deny, "token": bool(mb.cfg.get("user_token_sha256") if p is USER else p.get("token_sha256"))}
+
+
+def emit_perm_row(r):
+    emit("%s（%s%s）%s" % (r["name"], ROLE_ZH.get(r["role"], r["role"]), "" if r["active"] else "，不在任",
+                         "  [令牌]" if r["token"] else ""))
+    emit("  预设：%s" % ("全部权限" if r["preset"] == ["*"] else ("、".join(r["preset"]) or "（无）")))
+    if r["allow"]:
+        emit("  授予：%s" % "、".join(r["allow"]))
+    if r["deny"]:
+        emit("  收回：%s" % "、".join(r["deny"]))
+
+
+def parse_perm_args(mb, items):
+    """命令行给的权限（可逗号分隔）逐个校验并规范化；点名的参与方必须在花名册里。"""
+    out = []
+    for raw in items or []:
+        for x in [s.strip() for s in re.split(r"[,，、\s]+", raw) if s.strip()]:
+            pe = parse_perm(x)
+            if pe is None:
+                raise CliError("看不懂的权限 %r：写作 键[:范围]，键见 perm list，范围可写参与方名、@controller、"
+                               "@assistants、@observers 或队列名" % x, 2)
+            key, scope = pe
+            if scope and not scope.startswith("@") and PERM_SCOPE.get(key) == "who" and mb.get(scope) is None:
+                raise CliError("权限 %s 点名的 %s 不在花名册里" % (x, scope), 2)
+            t = perm_text(key, scope)
+            if t not in out:
+                out.append(t)
+    return out
+
+
+def cmd_perm_list(a):
+    mb = open_mb(a)
+    cfg = mb.cfg
+    cat = [{"perm": k, "scope": s, "scope_zh": SCOPE_ZH[s], "desc": d} for k, s, d in PERM_CATALOG]
+    presets = dict((r, role_preset(cfg, r)) for r in PRESET_ROLES)
+    custom = sorted((cfg.get("presets") or {}).keys())
+    if a.json:
+        emit_json({"catalog": cat, "presets": presets, "custom_presets": custom})
+        return 0
+    emit("权限目录（写作 键[:范围]；范围可写参与方名、@controller、@assistants、@observers 或队列名，不写表示不限）：")
+    for c in cat:
+        emit("  %-13s %-14s %s" % (c["perm"], c["scope_zh"], c["desc"]))
+    emit("角色预设（主控与用户永远拥有全部权限）：")
+    for r in PRESET_ROLES:
+        emit("  %s%s：%s" % (ROLE_ZH[r], "（主控已自定义）" if r in custom else "（由通信策略推出）",
+                             "、".join(presets[r]) or "（无）"))
+    emit("判定：显式条目取最具体的一条（点名 > 角色组 > 不限），同样具体时收回优先；没有显式条目才看角色预设。")
+    return 0
+
+
+def cmd_perm_show(a):
+    mb = open_mb(a)
+    if a.name:
+        ps = [USER if a.name == "user" else mb.lookup(a.name)]
+    elif a.me:
+        ps = [mb.identity(a.me, need_active=False)]
+    else:
+        ps = mb.participants(True)
+    rows = [perm_row(mb, p) for p in ps]
+    if a.json:
+        emit_json({"participants": rows})
+        return 0
+    for r in rows:
+        emit_perm_row(r)
+    return 0
+
+
+def cmd_perm_check(a):
+    mb = open_mb(a)
+    p = USER if a.name == "user" else mb.lookup(a.name)
+    pe = parse_perm(a.perm)
+    if pe is None:
+        raise CliError("看不懂的权限 %r（见 perm list）" % a.perm, 2)
+    key, scope = pe
+    if key == "*":
+        raise CliError("check 要写具体的权限键", 2)
+    tgt = scope or a.target
+    target = None
+    if tgt:
+        target = tgt if PERM_SCOPE.get(key) == "queue" else (
+            dict(role=ROLE_SCOPES[tgt], active=True, name=tgt) if tgt in ROLE_SCOPES else mb.lookup(tgt))
+    ok, why = mb.perm_decide(p, key, target)
+    if a.json:
+        emit_json({"name": p["name"], "perm": key, "target": tgt or "", "allowed": ok, "why": why})
+    else:
+        emit("%s %s %s%s（%s）" % (p["name"], "可以" if ok else "不能", key, (" → " + tgt) if tgt else "", why))
+    return 0
+
+
+def _norm_entries(xs):
+    out = []
+    for x in xs or []:
+        pe = parse_perm(x)
+        t = perm_text(*pe) if pe else x  # 看不懂的条目（可能来自新版本）原样保留
+        if t not in out:
+            out.append(t)
+    return out
+
+
+def cmd_perm_edit(a):
+    op = a.op
+    mb = open_mb(a)
+    me = mb.identity(a.me or "")
+    mb.require_controller(me)
+    t = mb.lookup(a.name)
+    if t["role"] == "controller" and t["active"]:
+        raise CliError("主控永远拥有全部权限，不用授予或收回", 2)
+    perms = parse_perm_args(mb, a.perms)
+    if op != "reset" and not perms:
+        raise CliError("perm %s 需要至少一个权限" % op, 2)
+
+    def fn(cfg):
+        p = [x for x in cfg["participants"] if x["name"] == t["name"]][0]
+        allow, deny = _norm_entries(p.get("allow")), _norm_entries(p.get("deny"))
+        if op == "grant":
+            deny = [x for x in deny if x not in perms]
+            allow += [x for x in perms if x not in allow]
+        elif op == "revoke":
+            allow = [x for x in allow if x not in perms]
+            deny += [x for x in perms if x not in deny]
+        elif perms:
+            allow = [x for x in allow if x not in perms]
+            deny = [x for x in deny if x not in perms]
+        else:
+            allow, deny = [], []
+        p["allow"], p["deny"] = allow, deny
+    mb.edit_config(me["name"], "perm-" + op, fn, {"name": t["name"], "perms": perms})
+    word = {"grant": "授予你", "revoke": "收回你的", "reset": "把你的权限重置为角色预设"}[op]
+    text = "%s %s%s" % (me["name"], word, ("：" + "、".join(perms)) if perms else "")
+    if op == "reset" and perms:
+        text = "%s 去掉了你的显式权限条目（回到角色预设）：%s" % (me["name"], "、".join(perms))
+    notify_system(mb, [t["name"]], "perm", text + "。权限变动即时生效；用 perm show（MCP：mailbox_perm show）查看。",
+                  me["name"], "权限变更")
+    row = perm_row(mb, mb.get(t["name"]))
+    if a.json:
+        emit_json(row)
+    else:
+        emit("已%s %s 的权限%s" % ({"grant": "授予", "revoke": "收回", "reset": "重置"}[op], t["name"],
+                                ("：" + "、".join(perms)) if perms else "（回到角色预设）"))
+        emit_perm_row(row)
+    return 0
+
+
+def cmd_perm_preset(a):
+    mb = open_mb(a)
+    role = a.role
+    cur = role_preset(mb.cfg, role)
+    if a.set is None and not a.add and not a.remove and not a.reset:
+        if a.json:
+            emit_json({"role": role, "preset": cur, "custom": role in (mb.cfg.get("presets") or {})})
+        else:
+            emit("%s预设：%s" % (ROLE_ZH[role], "、".join(cur) or "（无）"))
+        return 0
+    me = mb.identity(a.me or "")
+    mb.require_controller(me)
+    if a.reset:
+        new = None
+    elif a.set is not None:
+        new = parse_perm_args(mb, [a.set]) if a.set.strip() else []
+    else:
+        add, rm = parse_perm_args(mb, a.add), parse_perm_args(mb, a.remove)
+        new = [x for x in _norm_entries(cur) if x not in rm] + [x for x in add if x not in cur]
+
+    def fn(cfg):
+        ps = dict(cfg.get("presets") or {})
+        if new is None:
+            ps.pop(role, None)
+        else:
+            ps[role] = new
+        if ps:
+            cfg["presets"] = ps
+        else:
+            cfg.pop("presets", None)
+    cfg = mb.edit_config(me["name"], "perm-preset", fn, {"role": role, "preset": new})
+    after = role_preset(cfg, role)
+    notify_system(mb, [p["name"] for p in mb.participants(True) if p["role"] == role], "perm",
+                  "%s 改了%s的角色预设：%s" % (me["name"], ROLE_ZH[role], "、".join(after) or "（无）"), me["name"], "权限变更")
+    if a.json:
+        emit_json({"role": role, "preset": after, "custom": new is not None})
+    else:
+        emit("%s预设已%s：%s" % (ROLE_ZH[role], "恢复为由通信策略推出" if new is None else "改为", "、".join(after) or "（无）"))
+    return 0
+
+
+def cmd_perm_token(a):
+    mb = open_mb(a)
+    me = mb.identity(a.me or "")
+    mb.require_controller(me)
+    name = "user" if a.name == "user" else mb.lookup(a.name)["name"]
+    tok = None if a.clear else "amb_" + secrets.token_hex(20)
+
+    def fn(cfg):
+        if name == "user":
+            if tok:
+                cfg["user_token_sha256"] = token_hash(tok)
+            else:
+                cfg.pop("user_token_sha256", None)
+            return
+        p = [x for x in cfg["participants"] if x["name"] == name][0]
+        if tok:
+            p["token_sha256"] = token_hash(tok)
+        else:
+            p.pop("token_sha256", None)
+    mb.edit_config(me["name"], "perm-token", fn, {"name": name, "clear": bool(a.clear)})
+    if not tok:
+        emit("已清除 %s 的身份令牌：以后以 %s 的身份操作不再需要令牌" % (name, name))
+        return 0
+    if a.out:
+        atomic_write(os.path.abspath(os.path.expanduser(a.out)), (tok + "\n").encode("utf-8"))
+        where = "已写入 %s（只有本人可读的权限位；这是唯一一次拿到明文）" % slash(os.path.abspath(a.out))
+    else:
+        where = "令牌（只显示这一次，花名册里只存它的 SHA-256）：\n%s" % tok
+    emit("已给 %s 设身份令牌。%s\n以后以 %s 的身份操作都要出示它：MCP 配置里设环境变量 AGENT_MAILBOX_TOKEN，"
+         "或命令行加 --token-file <文件>。令牌不要写进信件、通话或通知（会被当成凭据拒收）。" % (name, where, name))
+    return 0
+
+
 # ------------------------------------------------------------------ 发信
 def cmd_send(a):
     mb = open_mb(a)
@@ -1674,8 +2786,6 @@ def cmd_send(a):
     pol = cfg["policy"]
     me = mb.identity(a.me or "", need_active=False)
     if me is not USER:
-        if me["role"] == "observer":
-            raise CliError("旁听者（observer）不发信", 2)
         if not me["active"] and pol["inactive_send"] == "deny":
             raise CliError("%s 已不在任，不能发信；如需恢复请主控 roster update %s --activate assistant" % (
                 me["name"], me["name"]), 2)
@@ -1729,13 +2839,14 @@ def cmd_send(a):
             raise CliError("%s 已不在任；确需投递旧箱请加 --allow-inactive" % t["name"], 2)
         if not mb.box_of_target(t):
             raise CliError("%s 没有收件箱，无法投递" % t["name"], 2)
-    if broadcast and pol["broadcast"] == "controller" and not (me is USER or me["role"] == "controller"):
-        raise CliError("按策略只有主控能广播（policy.broadcast=controller）", 2)
+    # 权限：旁听者默认不发信、助手互通与广播的旧策略都已折进角色预设，主控可按人授予或收回
+    if broadcast:
+        mb.require_perm(me, "broadcast")
+    for t in people:
+        mb.require_perm(me, "send", t)
     cc = []
     if me is not USER and me["role"] == "assistant":
         peers = [t for t in people if t["role"] == "assistant"]
-        if peers and pol["assistant_to_assistant"] == "deny":
-            raise CliError("按策略助手之间不直接通信（policy.assistant_to_assistant=deny），请经主控转达", 2)
         if peers and pol["assistant_to_assistant"] == "cc-controller":
             c = mb.controller()
             if all(t["name"] != c["name"] for t in people):
@@ -2007,6 +3118,7 @@ class Watcher(object):
         self.started = time.time()
         self.rev = mb.cfg.get("revision")
         self.cfg_error = False
+        self.notify_mark, self.talk_mark = 0, {}
         # 嵌入式用法（MCP 服务）：事件交给回调而不打印；stop_event 置位即退出循环
         self.sink = getattr(a, "sink", None)
         self.stop_event = getattr(a, "stop_event", None)
@@ -2068,11 +3180,15 @@ class Watcher(object):
         self.cursor_mtime = mt
         self.read_set = set(d.get("read") or [])
         self.notified = set(d.get("notified") or []) | self.new_notified
+        self.notify_mark = max(self.notify_mark, int(d.get("notify_seen") or 0))
+        for k, v in (d.get("talk_seen") or {}).items():
+            self.talk_mark[k] = max(self.talk_mark.get(k, 0), int(v or 0))
 
     def setup(self):
         letters = self.mb.scan()[0]
         self.st = copy.deepcopy(self.mb.state(self.me, my_letters(self.mb, self.me, letters)))
         self.notified = set(self.st.get("notified") or [])
+        self.notify_mark, self.talk_mark = seen_pointers(self.mb, self.me["name"])
         for k in ("ledger", "journals", "mention_marks", "reminders", "waits_fired"):
             self.st.setdefault(k, {})
         self.st.setdefault("journal_globs", [])
@@ -2150,6 +3266,55 @@ class Watcher(object):
                 continue
             self.add({"mine": "MAIL", "shared": "MAIL-SHARED", "all": "MAIL-ALL"}[cls], line, file=l.name,
                      urgent=l.urgent)
+
+    # 通知流与通话（按已看指针增量读，文件没变不重读）
+    def poll_notify(self):
+        name = self.me["name"]
+        try:
+            items = cached_load(feed_path(self.mb, name), jsonl_read) or []
+        except CliError as e:
+            self.add("ERROR", "通知流读不了：%s" % str(e).split("\n")[0], real=False)
+            return
+        for e in items:
+            if e["seq"] <= self.notify_mark:
+                continue
+            self.notify_mark = e["seq"]
+            lines = (e.get("text") or "").split("\n")
+            self.add("NOTIFY", "%s#%d [%s] %s%s：%s" % (
+                "[急]" if e.get("urgent") else "", e["seq"], e.get("kind") or "note", e.get("from") or "系统",
+                ("「%s」" % e["title"]) if e.get("title") else "", clip(lines[0], 300)),
+                [clip(l, 300) for l in lines[1:40]], seq=e["seq"], urgent=bool(e.get("urgent")),
+                notify_kind=e.get("kind") or "note")
+
+    def poll_talk(self):
+        name = self.me["name"]
+        for meta in talk_mine(self.mb, name):
+            cid = meta["id"]
+            m = talk_member(meta, name)
+            base = max(int(m.get("since") or 0), self.talk_mark.get(cid, 0))
+            try:
+                new = [x for x in talk_log(self.mb, cid) if x["seq"] > base]
+            except CliError:
+                continue
+            if not new:
+                continue
+            self.talk_mark[cid] = new[-1]["seq"]
+            topic = ("「%s」" % meta["topic"]) if meta.get("topic") else ""
+            for x in new:
+                if x.get("from") == name:
+                    continue
+                if x.get("kind", "msg") != "msg":
+                    self.add("TALK", "%s%s #%d · %s" % (cid, topic, x["seq"], x.get("text") or ""), conv=cid,
+                             seq=x["seq"], sender=x.get("from") or "")
+                    continue
+                lines = (x.get("text") or "").split("\n")
+                sub = [clip(l, 300) for l in lines[1:40]]
+                if len(lines) > 40:
+                    sub.append("…（全文用 talk read %s 查看）" % cid)
+                self.add("TALK", "%s%s%s #%d %s%s：%s" % (
+                    "[急]" if x.get("urgent") else "", cid, topic, x["seq"], x.get("from") or "?",
+                    ("（回复 #%d）" % x["reply_to"]) if x.get("reply_to") else "", clip(lines[0], 300)), sub,
+                    conv=cid, seq=x["seq"], sender=x.get("from") or "", urgent=bool(x.get("urgent")))
 
     def mention_keys(self):
         keys = [self.me["name"], self.me["display"]] + list(self.me["aliases"])
@@ -2401,9 +3566,17 @@ class Watcher(object):
         def newer(a, b):
             return max(float(a or 0), float(b or 0))
 
+        seen_n, seen_t = (self.notify_mark, dict(self.talk_mark)) if self.sink is None else (None, None)
+
         def fn(d):
             d["notified"] = sorted(set(d.get("notified") or []) | new)
             d.setdefault("baseline_at", st.get("baseline_at") or iso_utc())
+            if seen_n is not None:
+                d["notify_seen"] = max(int(d.get("notify_seen") or 0), seen_n)
+                ts = dict(d.get("talk_seen") or {})
+                for k, v in seen_t.items():
+                    ts[k] = max(int(ts.get(k) or 0), int(v))
+                d["talk_seen"] = ts
             if only_notified:
                 return
             j = dict(d.get("journals") or {})
@@ -2470,6 +3643,8 @@ class Watcher(object):
                     self.add("ERROR", str(e), real=False)
                     letters = []
                 self.poll_mail(letters)
+                self.poll_notify()
+                self.poll_talk()
                 if self.a.mentions:
                     self.poll_mentions(letters)
                 self.poll_ledgers()
@@ -2694,6 +3869,7 @@ def cmd_status(a):
         mb.require_writable()
         if me is None:
             raise CliError("写状态板要 --as 本方身份", 2)
+        mb.require_perm(me, "status")
         if a.to:
             t = mb.find(a.to)
             if isinstance(t, str):
@@ -2717,6 +3893,874 @@ def cmd_status(a):
     raise CliError("未知的 status 动作：%s" % act, 2)
 
 
+# ------------------------------------------------------------------ 通知、通话、队列、加入：命令
+def text_arg(a, what, required=True):
+    f = getattr(a, "file", None)
+    if f:
+        return read_file_arg(f)
+    t = getattr(a, "text", None)
+    if t is not None:
+        return t
+    if getattr(a, "stdin", False):
+        return read_stdin_bytes()
+    if required:
+        raise CliError("没有%s：用 --text 或 --file" % what, 2)
+    return None
+
+
+def fmt_when(mb, iso):
+    t = ts_of(iso)
+    return mb.fmt_time(t) if t else "?"
+
+
+def seen_upto(seen, unseen_sorted, shown):
+    """只把「连续展示过」的未看条目记为已看：被 --limit 截掉的较早条目留到下次。"""
+    s = seen
+    for e in unseen_sorted:
+        if e["seq"] <= seen:
+            continue
+        if e["seq"] not in shown:
+            break
+        s = e["seq"]
+    return s
+
+
+def emit_lines(prefix, text):
+    lines = (text or "").split("\n")
+    emit(prefix + lines[0])
+    for l in lines[1:]:
+        emit("    " + l)
+
+
+def talk_lines(mb, x):
+    head = "#%d %s %s" % (x["seq"], fmt_when(mb, x.get("at")), x.get("from") or "?")
+    if x.get("kind", "msg") != "msg":
+        return ["%s · %s" % (head, x.get("text") or "")]
+    flags = ("[急]" if x.get("urgent") else "") + (("（回复 #%d）" % x["reply_to"]) if x.get("reply_to") else "")
+    lines = (x.get("text") or "").split("\n")
+    return ["%s%s：%s" % (head, flags, lines[0])] + ["    " + l for l in lines[1:]]
+
+
+def notify_lines(mb, e, seen=None):
+    new = "[新]" if seen is not None and e["seq"] > seen else ""
+    lines = (e.get("text") or "").split("\n")
+    head = "%s%s#%d %s [%s] %s%s：%s" % (new, "[急]" if e.get("urgent") else "", e["seq"], fmt_when(mb, e.get("at")),
+                                       e.get("kind") or "note", e.get("from") or "系统",
+                                       ("「%s」" % e["title"]) if e.get("title") else "", lines[0])
+    return [head] + ["    " + l for l in lines[1:]]
+
+
+def cmd_notify_send(a):
+    mb = open_mb(a)
+    mb.require_writable()
+    me = mb.identity(a.me or "")
+    text = check_text(text_arg(a, "通知内容"), "通知", NOTIFY_MAX, a.allow_secret, mb.cfg.get("secret_patterns"))
+    people, everyone = resolve_people(mb, me, a.to, "通知")
+    if everyone:
+        mb.require_perm(me, "broadcast")
+    for p in people:
+        mb.require_perm(me, "notify", p)
+    cc = cc_controller(mb, me, people)
+    to = [p["name"] for p in people]
+    recs = []
+    for n in to + ([cc["name"]] if cc else []):
+        ref = {"to": to}
+        if cc and n == cc["name"]:
+            ref["cc"] = True
+        recs.append((n, notify_push(mb, n, "note", text, me["name"], a.title or "", a.urgent, ref)))
+    if a.json:
+        emit_json({"sent": [{"to": n, "seq": r["seq"], "cc": bool(r.get("ref", {}).get("cc"))} for n, r in recs]})
+    else:
+        emit("已通知 %s" % "、".join("%s（#%d%s）" % (n, r["seq"], "，抄送" if r.get("ref", {}).get("cc") else "")
+                                   for n, r in recs))
+    return 0
+
+
+def cmd_notify_list(a):
+    mb = open_mb(a)
+    me = mb.identity(a.me or "")
+    seen = seen_pointers(mb, me["name"])[0]
+    every = jsonl_read(feed_path(mb, me["name"]))
+    unseen = [e for e in every if e["seq"] > seen]
+    if a.all:
+        items = every[-a.limit:] if a.limit else every
+    else:
+        items = unseen[:a.limit] if a.limit else unseen
+    if items and not a.peek and not mb.read_only:
+        s = seen_upto(seen, unseen, set(e["seq"] for e in items))
+        if s > seen:
+            advance_seen(mb, me["name"], notify=s)
+    if a.json:
+        emit_json({"me": me["name"], "seen": seen, "unseen": len(unseen), "items": items})
+        return 0
+    emit("%s 的通知｜未看 %d 条%s" % (me["name"], len(unseen), "｜列出最近 %d 条" % len(items) if a.all else ""))
+    for e in items:
+        for l in notify_lines(mb, e, seen):
+            emit("  " + l)
+    if not items:
+        emit("  （没有%s）" % ("通知" if a.all else "未看的通知"))
+    return 0
+
+
+def talk_after_post(mb, me, a, meta, rec, created=False):
+    cid = meta["id"]
+    others = [p["name"] for p in talk_people(mb, meta, but=me["name"])]
+    online, pos = {}, {}
+    for n in others:
+        if n == "user":
+            continue
+        online[n] = presence_online(mb, n)
+        for i, r in enumerate(talk_queue(mb, n)):
+            if r["conv"] == cid:
+                pos[n] = i + 1
+    wait = float(getattr(a, "wait", 0) or 0)
+    replies = []
+    if wait > 0:
+        replies = poll_until(wait, lambda: talk_replies(mb, me, cid, rec["seq"])) or []
+        if replies and not mb.read_only:
+            advance_seen(mb, me["name"], talk={cid: max(x["seq"] for x in replies)})
+    data = {"conv": talk_brief(meta), "message": rec, "created": created, "online": online, "queue_position": pos,
+            "replies": replies, "timeout": bool(wait > 0 and not replies)}
+    if a.json:
+        emit_json(data)
+    else:
+        emit("已%s通话 %s%s｜第 %d 条｜成员 %s" % ("发起" if created else "发到", cid,
+                                          ("「%s」" % meta["topic"]) if meta.get("topic") else "", rec["seq"],
+                                          "、".join(talk_brief(meta)["members"])))
+        for n in others:
+            if n in online:
+                emit("  %s：%s%s" % (n, "监视在线" if online[n] else "监视不在线（可能很久才回）",
+                                    "，本通话排在其来电队列第 %d 位" % pos[n] if pos.get(n) else ""))
+        if wait > 0:
+            if replies:
+                emit("回复：")
+                for x in replies:
+                    for l in talk_lines(mb, x):
+                        emit("  " + l)
+            else:
+                emit("TIMEOUT %d 秒内没有回复；稍后用 talk wait %s 或 talk read %s 查看" % (wait, cid, cid))
+    return 3 if data["timeout"] else 0
+
+
+def talk_text(mb, a):
+    return check_text(text_arg(a, "通话内容"), "通话内容", TALK_MAX, a.allow_secret, mb.cfg.get("secret_patterns"))
+
+
+def cmd_talk_start(a):
+    mb = open_mb(a)
+    mb.require_writable()
+    me = mb.identity(a.me or "")
+    text = talk_text(mb, a)
+    people, everyone = resolve_people(mb, me, a.to, "通话")
+    if everyone:
+        mb.require_perm(me, "broadcast")
+    for p in people:
+        mb.require_perm(me, "talk", p)
+    cc = cc_controller(mb, me, people)
+    meta = talk_create(mb, me, people + ([cc] if cc else []), a.topic or "")
+    if cc:
+        with FileLock(mb.p("locks", "talk-%s.lock" % meta["id"])):
+            append_seq(talk_log_path(mb, meta["id"]), _talk_record(
+                me, "join", "按策略（assistant_to_assistant=cc-controller）主控 %s 一同在场" % cc["name"], who=[cc["name"]]))
+    rec, meta = talk_post(mb, me, meta["id"], text, urgent=a.urgent)
+    return talk_after_post(mb, me, a, meta, rec, created=True)
+
+
+def cmd_talk_say(a):
+    mb = open_mb(a)
+    mb.require_writable()
+    me = mb.identity(a.me or "")
+    rec, meta = talk_post(mb, me, norm_conv(a.conv), talk_text(mb, a), a.reply_to or 0, a.urgent)
+    return talk_after_post(mb, me, a, meta, rec)
+
+
+def cmd_talk_call(a):
+    mb = open_mb(a)
+    mb.require_writable()
+    me = mb.identity(a.me or "")
+    who = mb.lookup(a.who)
+    if who["name"] == me["name"]:
+        raise CliError("不能呼叫自己", 2)
+    if not who["active"]:
+        raise CliError("%s 已不在任" % who["name"], 2)
+    text = talk_text(mb, a)
+    mb.require_perm(me, "talk", who)
+    cc = cc_controller(mb, me, [who])
+    meta, created = None, False
+    if not a.new:
+        meta = talk_find_pair(mb, me, who, cc)
+    if meta is None:
+        meta = talk_create(mb, me, [who] + ([cc] if cc else []), a.topic or "%s 呼叫 %s" % (me["name"], who["name"]))
+        created = True
+    rec, meta = talk_post(mb, me, meta["id"], text, urgent=a.urgent)
+    return talk_after_post(mb, me, a, meta, rec, created)
+
+
+def talk_access(mb, me, meta):
+    """读通话：成员（含已退出的）、主控、用户或有 talk.audit 的人。"""
+    if me is USER or talk_member(meta, me["name"]) or mb.can(me, "talk.audit"):
+        return
+    raise CliError("你不在通话 %s 里，也没有旁听权限 talk.audit" % meta["id"], 2)
+
+
+def cmd_talk_read(a):
+    mb = open_mb(a)
+    me = mb.identity(a.me or "")
+    cid = norm_conv(a.conv)
+    meta = talk_meta(mb, cid, fresh=True)
+    if meta is None:
+        raise CliError("没有通话 %s（talk list 查看）" % cid, 2)
+    talk_access(mb, me, meta)
+    msgs = talk_log(mb, cid, fresh=True)
+    seen = seen_pointers(mb, me["name"])[1].get(cid, 0)
+    m = talk_member(meta, me["name"])
+    base = max(seen, int((m or {}).get("since") or 0))
+    unread = [x for x in msgs if x["seq"] > base and x.get("from") != me["name"]] if m else []
+    if a.since is not None:
+        shown = [x for x in msgs if x["seq"] > a.since]
+    elif a.unread:
+        shown = unread
+    else:
+        shown = msgs
+    if a.limit:
+        shown = shown[:a.limit] if a.unread else shown[-a.limit:]
+    if m and not a.peek and not mb.read_only and unread:
+        s = seen_upto(base, unread, set(x["seq"] for x in shown))
+        if s > base:
+            advance_seen(mb, me["name"], talk={cid: s})
+    if a.json:
+        emit_json({"conv": talk_brief(meta), "messages": shown, "unread": len(unread), "total": len(msgs)})
+        return 0
+    b = talk_brief(meta)
+    emit("通话 %s%s｜%s｜成员 %s%s｜共 %d 条，未读 %d" % (
+        cid, ("「%s」" % b["topic"]) if b["topic"] else "", "进行中" if b["state"] == "open" else "已结束",
+        "、".join(b["members"]), ("｜已退出 " + "、".join(b["left"])) if b["left"] else "", len(msgs), len(unread)))
+    for x in shown:
+        for l in talk_lines(mb, x):
+            emit("  " + l)
+    return 0
+
+
+def cmd_talk_list(a):
+    mb = open_mb(a)
+    me = mb.identity(a.me or "")
+    seen = seen_pointers(mb, me["name"])[1]
+    if a.everyone:
+        if not (me is USER or mb.can(me, "talk.audit")):
+            raise CliError("列出全部通话要旁听权限 talk.audit（主控、用户自带）", 2)
+        metas = [m for m in (talk_meta(mb, c) for c in talk_ids(mb)) if m and (a.all or m.get("state") == "open")]
+    else:
+        metas = talk_mine(mb, me["name"], closed=a.all)
+    rows = []
+    for meta in metas:
+        log = talk_log(mb, meta["id"])
+        un = [x for x in talk_unread(mb, me["name"], meta, seen) if x.get("kind", "msg") == "msg"]
+        last = log[-1] if log else None
+        rows.append(dict(talk_brief(meta), unread=len(un), messages=len(log),
+                         last=({"seq": last["seq"], "at": last.get("at"), "from": last.get("from"),
+                                "text": clip((last.get("text") or "").split("\n")[0], 120)} if last else None)))
+    if a.json:
+        emit_json({"me": me["name"], "conversations": rows})
+        return 0
+    emit("%s 的通话 %d 个%s" % (me["name"], len(rows), "（含已结束）" if a.all else ""))
+    for r in rows:
+        last = r["last"]
+        emit("  %s%s｜%s｜成员 %s｜未读 %d%s" % (
+            r["id"], ("「%s」" % r["topic"]) if r["topic"] else "", "进行中" if r["state"] == "open" else "已结束",
+            "、".join(r["members"]), r["unread"],
+            ("｜最后 #%d %s %s：%s" % (last["seq"], fmt_when(mb, last["at"]), last["from"], last["text"])) if last else ""))
+    if not rows:
+        emit("  （没有通话；用 talk call <对方> 或 talk start --to <对方> 发起）")
+    return 0
+
+
+def cmd_talk_queue(a):
+    mb = open_mb(a)
+    me = mb.identity(a.me or "")
+    who = me if not a.who else (USER if a.who == "user" else mb.lookup(a.who))
+    if who["name"] != me["name"] and not (me is USER or mb.can(me, "talk.audit")):
+        raise CliError("看别人的来电队列要旁听权限 talk.audit（主控、用户自带）", 2)
+    rows = talk_queue(mb, who["name"])
+    if a.json:
+        emit_json({"for": who["name"], "queue": rows})
+        return 0
+    emit("%s 的来电队列：%d 个通话等着回复（紧急的在前，其余先来后到）" % (who["name"], len(rows)))
+    for i, r in enumerate(rows):
+        emit("  %d. %s%s%s｜%s 起 %d 条未读｜最早 %s" % (
+            i + 1, "[急]" if r["urgent"] else "", r["conv"], ("「%s」" % r["topic"]) if r["topic"] else "", r["from"],
+            r["count"], fmt_when(mb, r["since"])))
+    return 0
+
+
+def cmd_talk_next(a):
+    mb = open_mb(a)
+    me = mb.identity(a.me or "")
+
+    def head():
+        q = talk_queue(mb, me["name"])
+        return q if q else None
+    q = poll_until(a.wait, head) if (a.wait or 0) > 0 else head()
+    if not q:
+        if a.json:
+            emit_json({"empty": True})
+        else:
+            emit("TIMEOUT 来电队列是空的" if (a.wait or 0) > 0 else "来电队列是空的")
+        return 3
+    cid = q[0]["conv"]
+    meta = talk_meta(mb, cid, fresh=True)
+    seen = seen_pointers(mb, me["name"])[1]
+    unread = talk_unread(mb, me["name"], meta, seen)
+    if unread and not a.peek and not mb.read_only:
+        advance_seen(mb, me["name"], talk={cid: unread[-1]["seq"]})
+    if a.json:
+        emit_json({"conv": talk_brief(meta), "messages": unread, "queue_left": len(q) - 1})
+        return 0
+    b = talk_brief(meta)
+    emit("接通 %s%s｜成员 %s｜队列里还有 %d 个" % (cid, ("「%s」" % b["topic"]) if b["topic"] else "", "、".join(b["members"]),
+                                         len(q) - 1))
+    for x in unread:
+        for l in talk_lines(mb, x):
+            emit("  " + l)
+    emit("用 talk say %s --text … 回复" % cid)
+    return 0
+
+
+def cmd_talk_change(a):
+    mb = open_mb(a)
+    mb.require_writable()
+    me = mb.identity(a.me or "")
+    cid = norm_conv(a.conv)
+    people, cc = None, None
+    if a.op == "invite":
+        people, everyone = resolve_people(mb, me, a.to, "邀请")
+        if everyone:
+            mb.require_perm(me, "broadcast")
+        meta = talk_meta(mb, cid, fresh=True) or {}
+        cc = cc_controller(mb, me, talk_people(mb, meta, but=me["name"]) + people) if meta else None
+    rec, meta = talk_change(mb, me, cid, a.op, people, cc)
+    if a.json:
+        emit_json({"conv": talk_brief(meta), "record": rec})
+    else:
+        emit("通话 %s：%s" % (cid, rec["text"]))
+    return 0
+
+
+def cmd_talk_wait(a):
+    mb = open_mb(a)
+    me = mb.identity(a.me or "")
+    only = norm_conv(a.conv) if a.conv else None
+
+    def check():
+        seen = seen_pointers(mb, me["name"])[1]
+        metas = [talk_meta(mb, only, fresh=True)] if only else talk_mine(mb, me["name"])
+        out = []
+        for meta in metas:
+            if meta:
+                un = talk_unread(mb, me["name"], meta, seen)
+                if un:
+                    out.append((meta, un))
+        return out
+    got = poll_until(a.timeout, check)
+    if not got:
+        if a.json:
+            emit_json({"timeout": True})
+        else:
+            emit("TIMEOUT %d 秒内通话里没有新消息" % a.timeout)
+        return 3
+    if not mb.read_only:
+        advance_seen(mb, me["name"], talk=dict((m["id"], un[-1]["seq"]) for m, un in got))
+    if a.json:
+        emit_json({"conversations": [dict(talk_brief(m), messages=un) for m, un in got]})
+        return 0
+    for meta, un in got:
+        emit("通话 %s%s：" % (meta["id"], ("「%s」" % meta["topic"]) if meta.get("topic") else ""))
+        for x in un:
+            for l in talk_lines(mb, x):
+                emit("  " + l)
+    return 0
+
+
+def job_brief(q, j):
+    d = dict((k, j.get(k)) for k in ("id", "title", "from", "at", "priority", "to", "status", "attempts", "claimed_by",
+                                    "claimed_at", "lease_until", "finished_at", "finished_by", "error"))
+    d["queue"] = q["name"]
+    if j["status"] == "pending":
+        d["position"] = queue_position(q, j["id"])
+    return d
+
+
+def job_lines(mb, q, j, full=False):
+    st = JOB_ZH.get(j["status"], j["status"])
+    if j["status"] == "pending":
+        st += "，第 %d 位" % queue_position(q, j["id"])
+    elif j["status"] == "claimed":
+        st += "：%s，租约到 %s" % (j.get("claimed_by"), fmt_when(mb, j.get("lease_until")))
+    elif j.get("finished_by"):
+        st += "：%s" % j["finished_by"]
+    head = "#%d [%s] %s「%s」｜%s 投于 %s%s%s%s" % (
+        j["id"], st, ("优先级 %d " % j["priority"]) if j.get("priority") else "", j.get("title"), j.get("from"),
+        fmt_when(mb, j.get("at")), ("｜指派 " + j["to"]) if j.get("to") else "",
+        ("｜第 %d 次尝试" % j["attempts"]) if j.get("attempts") else "", ("｜" + clip(j["error"], 200)) if j.get("error") else "")
+    out = [head]
+    if full:
+        if j.get("body"):
+            out += ["  内容："] + ["    " + l for l in j["body"].split("\n")]
+        if j.get("result"):
+            out += ["  结果："] + ["    " + l for l in j["result"].split("\n")]
+        for at, ev, who, detail in j.get("log") or []:
+            out.append("  · %s %s %s%s" % (fmt_when(mb, at), ev, who, ("：" + detail) if detail else ""))
+    return out
+
+
+def queue_wait_final(mb, name, jid, seconds):
+    def check():
+        try:
+            q = queue_view(mb, name)
+            j = queue_job(q, jid)
+        except CliError:
+            return None
+        return (q, j) if j["status"] in JOB_FINAL else None
+    return poll_until(seconds, check)
+
+
+def emit_job_result(mb, a, q, j, extra=None):
+    if a.json:
+        d = dict(job_brief(q, j), body=j.get("body") or "", result=j.get("result") or "", log=j.get("log") or [])
+        d.update(extra or {})
+        emit_json(d)
+    else:
+        for l in job_lines(mb, q, j, full=True):
+            emit(l)
+
+
+def cmd_queue_list(a):
+    mb = open_mb(a)
+    rows = []
+    for n in queue_names(mb):
+        try:
+            q = queue_view(mb, n)
+        except CliError as e:
+            rows.append({"name": n, "error": str(e).split("\n")[0]})
+            continue
+        cnt = dict((s, 0) for s in JOB_ZH)
+        for j in q["jobs"]:
+            cnt[j["status"]] = cnt.get(j["status"], 0) + 1
+        rows.append(dict({"name": n, "desc": q.get("desc") or "", "created_by": q.get("created_by"),
+                          "lease_seconds": q.get("lease_seconds"), "max_attempts": q.get("max_attempts"),
+                          "consumers": q.get("consumers") or [], "notify": q.get("notify", True)}, **cnt))
+    if a.json:
+        emit_json({"queues": rows})
+        return 0
+    emit("队列 %d 个" % len(rows))
+    for r in rows:
+        if "error" in r:
+            emit("  %s｜读不了：%s" % (r["name"], r["error"]))
+            continue
+        emit("  %s%s｜排队 %d，已领 %d，完成 %d，失败 %d｜租约 %d 秒，最多尝试 %d 次%s" % (
+            r["name"], ("（%s）" % r["desc"]) if r["desc"] else "", r["pending"], r["claimed"], r["done"], r["failed"],
+            r["lease_seconds"], r["max_attempts"], ("｜领取名单 " + "、".join(r["consumers"])) if r["consumers"] else ""))
+    if not rows:
+        emit("  （还没有队列；主控用 queue create <名字> 建，或直接 queue push）")
+    return 0
+
+
+def cmd_queue_create(a):
+    mb = open_mb(a)
+    me = mb.identity(a.me or "")
+    name = check_queue_name(a.name)
+    mb.require_perm(me, "queue.admin", name)
+    consumers = None
+    if a.consumers is not None:
+        consumers = [mb.lookup(x)["name"] for x in re.split(r"[,，、\s]+", a.consumers) if x.strip()]
+    if a.lease is not None and not 10 <= a.lease <= 86400 * 7:
+        raise CliError("--lease 须在 10 秒到 7 天之间", 2)
+    if a.max_attempts is not None and not 1 <= a.max_attempts <= 100:
+        raise CliError("--max-attempts 须在 1 到 100 之间", 2)
+    made = []
+
+    def create():
+        made.append(True)
+        return queue_new(name, me)
+
+    def fn(q, notes):
+        for k, v in (("desc", a.desc), ("lease_seconds", a.lease), ("max_attempts", a.max_attempts),
+                     ("consumers", consumers), ("notify", a.notify)):
+            if v is not None:
+                q[k] = clip(v, 300) if k == "desc" else v
+    _, q = queue_edit(mb, name, fn, create=create, actor=me["name"])
+    if a.json:
+        emit_json({"created": bool(made), "queue": dict((k, v) for k, v in q.items() if k != "jobs")})
+    else:
+        emit("已%s队列 %s｜租约 %d 秒｜最多尝试 %d 次｜%s｜新任务%s通知" % (
+            "建" if made else "更新", name, q["lease_seconds"], q["max_attempts"],
+            ("领取名单 " + "、".join(q["consumers"])) if q.get("consumers") else "有 queue.take 权限的人都能领",
+            "" if q.get("notify", True) else "不"))
+    return 0
+
+
+def cmd_queue_push(a):
+    mb = open_mb(a)
+    me = mb.identity(a.me or "")
+    name = check_queue_name(a.name)
+    mb.require_perm(me, "queue.push", name)
+    title = re.sub(r"\s+", " ", a.title or "").strip()
+    if not title:
+        raise CliError("任务要有标题（--title）", 2)
+    check_text(title, "任务标题", 600, a.allow_secret, mb.cfg.get("secret_patterns"))
+    raw = text_arg(a, "任务内容", required=False)
+    body = check_text(raw, "任务内容", JOB_MAX, a.allow_secret, mb.cfg.get("secret_patterns")) if raw is not None else ""
+    to = None
+    if a.to:
+        to = mb.lookup(a.to)
+        if not to["active"]:
+            raise CliError("%s 已不在任" % to["name"], 2)
+        if not mb.can(to, "queue.take", name):
+            raise CliError("%s 没有从队列 %s 领任务的权限（queue.take），指派了也领不了" % (to["name"], name), 2)
+    create = None
+    if not os.path.exists(queue_path(mb, name)):
+        if not mb.can(me, "queue.admin", name):
+            raise CliError("没有队列 %s；请主控先 queue create %s" % (name, name), 2)
+        create = lambda: queue_new(name, me)
+
+    def fn(q, notes):
+        if len(queue_pending(q)) >= QUEUE_MAX_PENDING:
+            raise CliError("队列 %s 已有 %d 个任务在排队，到上限了" % (name, QUEUE_MAX_PENDING), 2)
+        q["seq"] = int(q.get("seq") or 0) + 1
+        j = {"id": q["seq"], "title": clip(title, 200), "body": body, "from": me["name"], "at": iso_utc(),
+             "priority": int(a.priority or 0), "to": to["name"] if to else "", "status": "pending", "attempts": 0,
+             "claimed_by": "", "claimed_at": "", "lease_until": "", "result": "", "error": "", "finished_at": "",
+             "finished_by": ""}
+        job_log(j, "pushed", me["name"])
+        q["jobs"].append(j)
+        pos = queue_position(q, j["id"])
+        recips = [j["to"]] if j["to"] else (queue_consumers(mb, q, me) if q.get("notify", True) else [])
+        if recips:
+            notes.append((recips, "job", "队列 %s 有新任务 #%d「%s」%s（优先级 %d，前面还有 %d 个）：用 queue take %s 领取"
+                                         "（MCP：mailbox_queue take）" % (name, j["id"], j["title"], "，指派给你" if j["to"] else "",
+                                                                        j["priority"], pos - 1, name),
+                          {"queue": name, "job": j["id"]}))
+        return dict(j)
+    j, q = queue_edit(mb, name, fn, create=create, actor=me["name"])
+    if (a.wait or 0) > 0:
+        got = queue_wait_final(mb, name, j["id"], a.wait)
+        if got:
+            emit_job_result(mb, a, got[0], got[1])
+            return 0
+        if a.json:
+            emit_json(dict(job_brief(q, queue_job(q, j["id"])), timeout=True))
+        else:
+            emit("已投到队列 %s：任务 #%d；TIMEOUT %d 秒内没有完成（queue wait %s %d 继续等）" % (
+                name, j["id"], a.wait, name, j["id"]))
+        return 3
+    if a.json:
+        emit_json(job_brief(q, queue_job(q, j["id"])))
+    else:
+        emit("已投到队列 %s：任务 #%d「%s」｜排第 %d 位%s" % (name, j["id"], j["title"], queue_position(q, j["id"]),
+                                                    ("｜指派 " + j["to"]) if j["to"] else ""))
+    return 0
+
+
+def queue_try_take(mb, me, name):
+    boss = me is USER or (me["role"] == "controller" and me["active"])
+
+    def fn(q, notes):
+        if q.get("consumers") and me["name"] not in q["consumers"] and not boss:
+            raise CliError("你不在队列 %s 的领取名单里（%s）" % (name, "、".join(q["consumers"])), 2)
+        cands = [j for j in q["jobs"] if j["status"] == "pending" and (not j.get("to") or j.get("to") == me["name"])]
+        if not cands:
+            return None
+        cands.sort(key=lambda j: (-int(j.get("priority") or 0), 0 if j.get("to") == me["name"] else 1, j["id"]))
+        j = cands[0]
+        j.update(status="claimed", claimed_by=me["name"], claimed_at=iso_utc(),
+                 lease_until=iso_at(time.time() + int(q.get("lease_seconds") or 900)))
+        j["attempts"] = int(j.get("attempts") or 0) + 1
+        job_log(j, "claimed", me["name"])
+        if j.get("from") != me["name"]:
+            notes.append(([j.get("from")], "job", "%s 领取了你投在队列 %s 的任务 #%d「%s」" % (
+                me["name"], name, j["id"], j.get("title")), {"queue": name, "job": j["id"]}))
+        return dict(j)
+    j, q = queue_edit(mb, name, fn, actor=me["name"])
+    return (q, j) if j else None
+
+
+def cmd_queue_take(a):
+    mb = open_mb(a)
+    me = mb.identity(a.me or "")
+    name = check_queue_name(a.name)
+    mb.require_perm(me, "queue.take", name)
+    got = queue_try_take(mb, me, name)
+    if got is None and (a.wait or 0) > 0:
+        state = {"key": None, "at": time.time()}
+
+        def tick():
+            # 队列文件变了才去抢；租约可能悄悄到期，所以至少每 10 秒也试一次
+            try:
+                st = os.stat(queue_path(mb, name))
+                key = (st.st_size, st.st_mtime_ns)
+            except OSError:
+                key = None
+            if key == state["key"] and time.time() - state["at"] < 10:
+                return None
+            state["key"], state["at"] = key, time.time()
+            return queue_try_take(mb, me, name)
+        got = poll_until(a.wait, tick)
+    if got is None:
+        if a.json:
+            emit_json({"empty": True, "queue": name})
+        else:
+            emit(("TIMEOUT %d 秒内" % a.wait if (a.wait or 0) > 0 else "现在") + "队列 %s 没有可领的任务" % name)
+        return 3
+    q, j = got
+    if a.json:
+        emit_job_result(mb, a, q, j, {"lease_seconds": q.get("lease_seconds")})
+    else:
+        emit("已领取队列 %s 的任务 #%d，租约 %d 秒（做完 queue done %s %d；需要更久 queue renew；做不了 queue release）" % (
+            name, j["id"], q.get("lease_seconds"), name, j["id"]))
+        emit_job_result(mb, a, q, j)
+    return 0
+
+
+def cmd_queue_act(a):
+    op = a.op
+    mb = open_mb(a)
+    me = mb.identity(a.me or "")
+    name = check_queue_name(a.name)
+    admin = mb.can(me, "queue.admin", name)
+    raw = text_arg(a, "说明", required=False)
+    text = check_text(raw, "结果" if op == "done" else "说明", JOB_MAX, a.allow_secret,
+                      mb.cfg.get("secret_patterns")) if raw is not None else ""
+
+    def fn(q, notes):
+        j = queue_job(q, a.job)
+        ref = {"queue": name, "job": j["id"]}
+        if op in ("done", "fail", "release", "renew"):
+            if j["status"] != "claimed":
+                hint = "（租约可能已到期、任务已放回排队或判为失败）" if j["status"] in ("pending", "failed") else ""
+                raise CliError("任务 #%d 现在是「%s」，不是已领状态%s" % (j["id"], JOB_ZH.get(j["status"]), hint), 2)
+            if j.get("claimed_by") != me["name"] and not admin:
+                raise CliError("任务 #%d 由 %s 领取，你不能处置（要 queue.admin 权限）" % (j["id"], j.get("claimed_by")), 2)
+        if op == "done":
+            j.update(status="done", result=text, finished_at=iso_utc(), finished_by=me["name"], lease_until="")
+            job_log(j, "done", me["name"])
+            notes.append(([j.get("from")], "job-done", "队列 %s 的任务 #%d「%s」已由 %s 完成%s" % (
+                name, j["id"], j.get("title"), me["name"], ("：" + clip(text, 1500)) if text else ""), ref))
+        elif op == "fail":
+            if a.retry and int(j.get("attempts") or 0) < int(q.get("max_attempts") or 1):
+                j.update(status="pending", claimed_by="", claimed_at="", lease_until="", error=clip(text, 2000))
+                job_log(j, "retry", me["name"], text)
+            else:
+                j.update(status="failed", error=clip(text or "（未说明原因）", 2000), finished_at=iso_utc(),
+                         finished_by=me["name"], lease_until="")
+                job_log(j, "failed", me["name"], text)
+                notes.append(([j.get("from")], "job-failed", "队列 %s 的任务 #%d「%s」失败（%s）：%s" % (
+                    name, j["id"], j.get("title"), me["name"], j["error"]), ref))
+        elif op == "release":
+            j.update(status="pending", claimed_by="", claimed_at="", lease_until="",
+                     attempts=max(0, int(j.get("attempts") or 0) - 1))
+            job_log(j, "released", me["name"], text)
+        elif op == "renew":
+            j["lease_until"] = iso_at(time.time() + int(q.get("lease_seconds") or 900))
+            job_log(j, "renewed", me["name"])
+        else:
+            if j.get("from") != me["name"] and not admin:
+                raise CliError("只有投放者（%s）或有 queue.admin 权限的人能取消任务 #%d" % (j.get("from"), j["id"]), 2)
+            if j["status"] in JOB_FINAL:
+                raise CliError("任务 #%d 已经%s" % (j["id"], JOB_ZH[j["status"]]), 2)
+            holder = j.get("claimed_by") if j["status"] == "claimed" else ""
+            j.update(status="cancelled", error=clip(text, 2000), finished_at=iso_utc(), finished_by=me["name"],
+                     lease_until="")
+            job_log(j, "cancelled", me["name"], text)
+            if holder:
+                notes.append(([holder], "job", "%s 取消了你领着的队列 %s 任务 #%d「%s」%s" % (
+                    me["name"], name, j["id"], j.get("title"), ("：" + text) if text else ""), ref))
+        return dict(j)
+    j, q = queue_edit(mb, name, fn, actor=me["name"])
+    if a.json:
+        emit_job_result(mb, a, q, j)
+    else:
+        word = {"done": "完成", "fail": "记为失败" if j["status"] == "failed" else "放回重试", "release": "放回排队",
+                "renew": "续租", "cancel": "取消"}[op]
+        emit("已%s队列 %s 的任务 #%d" % (word, name, j["id"]) +
+             ("（租约到 %s）" % fmt_when(mb, j.get("lease_until")) if op == "renew" else ""))
+    return 0
+
+
+def cmd_queue_show(a):
+    mb = open_mb(a)
+    name = check_queue_name(a.name)
+    q = queue_view(mb, name)
+    pend = queue_pending(q)
+    claimed = [j for j in q["jobs"] if j["status"] == "claimed"]
+    done = sorted([j for j in q["jobs"] if j["status"] in JOB_FINAL], key=lambda j: (j.get("finished_at") or "", j["id"]))
+    if not a.all:
+        done = done[-10:]
+    if a.json:
+        emit_json({"queue": dict((k, v) for k, v in q.items() if k != "jobs"),
+                   "pending": [job_brief(q, j) for j in pend], "claimed": [job_brief(q, j) for j in claimed],
+                   "finished": [job_brief(q, j) for j in done]})
+        return 0
+    emit("队列 %s%s｜排队 %d｜已领 %d｜租约 %d 秒｜最多尝试 %d 次" % (
+        name, ("（%s）" % q["desc"]) if q.get("desc") else "", len(pend), len(claimed), q["lease_seconds"], q["max_attempts"]))
+    for label, xs in (("排队", pend), ("已领", claimed), ("最近完成" if not a.all else "已结束", done)):
+        if xs:
+            emit("%s：" % label)
+            for j in xs:
+                emit("  " + job_lines(mb, q, j)[0])
+    return 0
+
+
+def cmd_queue_job(a):
+    mb = open_mb(a)
+    name = check_queue_name(a.name)
+    q = queue_view(mb, name)
+    emit_job_result(mb, a, q, queue_job(q, a.job))
+    return 0
+
+
+def cmd_queue_wait(a):
+    mb = open_mb(a)
+    name = check_queue_name(a.name)
+    queue_job(queue_view(mb, name), a.job)  # 先确认有这个任务
+    got = queue_wait_final(mb, name, a.job, a.timeout)
+    if not got:
+        if a.json:
+            emit_json({"timeout": True, "queue": name, "job": a.job})
+        else:
+            emit("TIMEOUT %d 秒内任务 #%d 没有结束" % (a.timeout, a.job))
+        return 3
+    emit_job_result(mb, a, got[0], got[1])
+    return 0
+
+
+def roster_admins(mb):
+    return [p["name"] for p in mb.participants(True)
+            if (p["role"] == "controller") or mb.can(p, "roster.admin")]
+
+
+def cmd_join(a):
+    mb = open_mb(a)
+    name = a.me or ""
+    if not NAME_RE.match(name) or name == "user":
+        raise CliError("申请加入要用 --as 给出想用的名字（小写字母、数字、. _ -，不能叫 user）：%r" % name, 2)
+    path = request_path(mb, name)
+    p = mb.get(name)
+    if a.status:
+        d = load_json_quiet(path)
+        res = {"name": name, "request": d, "in_roster": bool(p), "active": bool(p and p["active"]),
+               "role": p["role"] if p else ""}
+        if a.json:
+            emit_json(res)
+        else:
+            emit("%s：%s；申请 %s" % (name, ("在花名册里（%s%s）" % (ROLE_ZH.get(p["role"]), "，在任" if p["active"] else "，不在任"))
+                                    if p else "不在花名册里", (d or {}).get("status") or "无"))
+        return 0
+    if p and p["active"]:
+        emit("%s 已在花名册里（%s，在任），不用申请" % (name, ROLE_ZH.get(p["role"], p["role"])))
+        return 0
+    mb.require_writable()
+    fresh = False
+    with FileLock(mb.p("locks", "requests.lock")):
+        cur = load_json_quiet(path) or {}
+        pend = [r for r in requests_all(mb) if r.get("status") == "pending" and r.get("name") != name]
+        if len(pend) >= REQ_MAX_PENDING:
+            raise CliError("待批的加入申请已有 %d 个，请等主控处理" % len(pend), 2)
+        d = {"name": name, "model": a.model or cur.get("model") or "", "harness": a.harness or cur.get("harness") or "",
+             "display": a.display or cur.get("display") or "", "note": clip(a.note or cur.get("note") or "", 300),
+             "role": a.role, "host": HOST, "updated_at": iso_utc(), "status": "pending"}
+        fresh = cur.get("status") != "pending" or any(cur.get(k) != d[k] for k in ("model", "harness", "note", "role"))
+        d["at"] = cur.get("at") if cur.get("status") == "pending" else iso_utc()
+        atomic_write(path, dump_json(d))
+    if fresh:
+        notify_system(mb, roster_admins(mb), "join", "%s（%s / %s）申请以%s身份加入%s：用 roster approve %s 批准（可加 --allow 授权），"
+                                                     "或 roster reject %s（MCP：mailbox_roster approve / reject）" % (
+                          name, d["model"] or "-", d["harness"] or "-", ROLE_ZH.get(d["role"]),
+                          ("，附言：" + d["note"]) if d["note"] else "", name, name), name, "加入申请")
+    if (a.wait or 0) > 0:
+        def check():
+            r = load_json_quiet(path) or {}
+            return r if r.get("status") in ("approved", "rejected") else None
+        r = poll_until(a.wait, check, interval=1.0)
+        if not r:
+            emit("TIMEOUT %d 秒内主控没有处理 %s 的加入申请" % (a.wait, name))
+            return 3
+        if r["status"] == "approved":
+            emit("已获批准：%s 以%s身份加入（由 %s 批准）" % (name, ROLE_ZH.get(r.get("role")), r.get("decided_by")))
+            return 0
+        emit("加入申请被拒（%s）：%s" % (r.get("decided_by"), r.get("reason") or "未说明理由"))
+        return 1
+    emit("已申请加入（%s），等待主控批准；可用 join --status 查看，或 join --wait 秒数 等结果" % name)
+    return 0
+
+
+def cmd_roster_requests(a):
+    mb = open_mb(a)
+    me = mb.identity(a.me or "")
+    mb.require_roster_admin(me)
+    rows = [r for r in requests_all(mb) if a.all or r.get("status") == "pending"]
+    if a.json:
+        emit_json({"requests": rows})
+        return 0
+    emit("加入申请 %d 个%s" % (len(rows), "" if a.all else "（待批）"))
+    for r in rows:
+        emit("  %s｜%s / %s｜申请%s｜%s｜%s%s" % (
+            r.get("name"), r.get("model") or "-", r.get("harness") or "-", ROLE_ZH.get(r.get("role"), r.get("role")),
+            fmt_when(mb, r.get("at")), {"pending": "待批", "approved": "已批", "rejected": "已拒"}.get(r.get("status"), "?"),
+            ("｜附言：" + r["note"]) if r.get("note") else ""))
+    return 0
+
+
+def cmd_roster_decide(a):
+    mb = open_mb(a)
+    me = mb.identity(a.me or "")
+    mb.require_roster_admin(me)
+    path = request_path(mb, a.name)
+    req = load_json_quiet(path)
+    if not req or req.get("status") != "pending":
+        raise CliError("没有 %s 的待批加入申请（roster requests 查看）" % a.name, 2)
+    stamp = iso_utc()
+    if a.op == "reject":
+        req.update(status="rejected", decided_by=me["name"], decided_at=stamp, reason=clip(a.reason or "", 300))
+        with FileLock(mb.p("locks", "requests.lock")):
+            atomic_write(path, dump_json(req))
+        mb.log("roster", {"at": stamp, "actor": me["name"], "action": "reject", "detail": {"name": a.name}})
+        emit("已拒绝 %s 的加入申请" % a.name)
+        return 0
+    allow, deny = parse_perm_args(mb, a.allow), parse_perm_args(mb, a.deny)
+    if allow or deny:
+        mb.require_controller(me)  # 代管花名册的人能批准加入，但不能顺带授权
+    role = a.role or req.get("role") or "assistant"
+    old = mb.get(a.name)
+    box = a.box or (old or {}).get("box") or (default_box(a.name) if role == "assistant" else "")
+    if old is not None and old["active"]:
+        raise CliError("%s 已在任，不用批准" % a.name, 2)
+    if old is not None and box and BOX_RE.match(box) and not mb.read_only:
+        mb.adopt_box(a.name, box)  # 前任重新在任：箱里的历史信记为已读
+
+    def fn(cfg):
+        rec = {"name": a.name, "role": role, "display": req.get("display") or a.name, "model": req.get("model") or "",
+               "harness": req.get("harness") or "", "box": box, "active": True, "since": stamp, "until": "",
+               "note": a.note or req.get("note") or "", "allow": allow, "deny": deny}
+        for p in cfg["participants"]:
+            if p["name"] == a.name:
+                aliases = p.get("aliases") or []
+                p.update(rec)
+                p["aliases"] = aliases
+                return
+        cfg["participants"].append(norm_participant(dict(rec, aliases=[], session="")))
+    cfg = mb.edit_config(me["name"], "approve", fn, {"name": a.name, "role": role, "allow": allow, "deny": deny})
+    req.update(status="approved", decided_by=me["name"], decided_at=stamp, role=role)
+    with FileLock(mb.p("locks", "requests.lock")):
+        atomic_write(path, dump_json(req))
+    p = mb.get(a.name)
+    notify_system(mb, [a.name], "joined", "%s 批准你以%s身份加入；收件箱 %s%s。先看来信（inbox）和通知，再按主控登记开工。" % (
+        me["name"], ROLE_ZH.get(role), "、".join(mb.boxes_of(p)) or "-",
+        ("；额外授予 " + "、".join(allow)) if allow else ""), me["name"], "加入已批准")
+    emit("已批准 %s 以%s身份加入（收件箱 %s）%s；在任助手 %d/%d" % (
+        a.name, ROLE_ZH.get(role), box or "-", ("，授予 " + "、".join(allow)) if allow else "",
+        len([x for x in cfg["participants"] if x["role"] == "assistant" and x["active"]]), cfg["max_assistants"]))
+    return 0
+
+
 # ------------------------------------------------------------------ 总览与体检
 def cmd_who(a):
     mb = open_mb(a)
@@ -2735,9 +4779,12 @@ def cmd_who(a):
     rows = []
     for p in mb.participants(True):
         pres = load_json_quiet(mb.p("presence", p["name"] + ".json")) or {}
-        beat = ts_of(pres.get("beat"))
-        online = bool(beat and not pres.get("stopped") and time.time() - beat < 3 * Presence.BEAT)
+        online = presence_online(mb, p["name"])
         cur = load_json_quiet(mb.cursor_path(p["name"])) or {}
+        nseen, tseen = int(cur.get("notify_seen") or 0), dict(cur.get("talk_seen") or {})
+        talk_unread_n = sum(len([x for x in talk_unread(mb, p["name"], m, tseen) if x.get("kind", "msg") == "msg"])
+                            for m in talk_mine(mb, p["name"]))
+        notify_n = len(notify_unseen(mb, p["name"], nseen))
         read = set(cur.get("read") or [])
         unread = None
         if cur.get("baseline_at"):
@@ -2753,19 +4800,22 @@ def cmd_who(a):
         rows.append({"name": p["name"], "role": p["role"], "model": p["model"], "harness": p["harness"],
                      "online": online, "watch": {"pid": pres.get("pid"), "host": pres.get("host"),
                                                  "beat": pres.get("beat"), "stopped": pres.get("stopped")},
-                     "unread": unread, "last_sent": last,
+                     "unread": unread, "talk_unread": talk_unread_n, "notify_unseen": notify_n, "last_sent": last,
                      "tasks_open": len([x for x in t["tasks"] if x.get("status") != "done"]),
                      "waiting_on": (t.get("waiting_on") or {}).get("what")})
+    pending = [r["name"] for r in requests_all(mb) if r.get("status") == "pending"]
     if a.json:
         emit_json(rows)
         return 0
-    emit("信箱 %s｜线程 %s｜%s" % (slash(mb.root), mb.thread or "（无）", mb.fmt_time(time.time())))
+    emit("信箱 %s｜线程 %s｜%s%s" % (slash(mb.root), mb.thread or "（无）", mb.fmt_time(time.time()),
+                                 ("｜待批加入 " + "、".join(pending)) if pending else ""))
     for r in rows:
         last = ts_of(r["last_sent"])
-        emit("  %s %-18s %-4s %-18s 监视%s｜未读 %s｜上次发信 %s｜未完成 %d%s" % (
+        emit("  %s %-18s %-4s %-18s 监视%s｜未读 %s｜通话未读 %d｜通知 %d｜上次发信 %s｜未完成 %d%s" % (
             "●" if r["online"] else "○", r["name"], ROLE_ZH.get(r["role"]), clip("%s/%s" % (r["model"] or "-", r["harness"] or "-"), 18),
             "在线" if r["online"] else ("停于 " + (r["watch"]["stopped"] or "?") if r["watch"]["pid"] else "从未"),
-            "-" if r["unread"] is None else r["unread"], ago(time.time() - last) if last else "无记录",
+            "-" if r["unread"] is None else r["unread"], r["talk_unread"], r["notify_unseen"],
+            ago(time.time() - last) if last else "无记录",
             r["tasks_open"], ("｜等待 " + clip(r["waiting_on"], 40)) if r["waiting_on"] else ""))
     return 0
 
@@ -2867,6 +4917,8 @@ def cmd_doctor(a):
                         continue
         except OSError:
             pass
+    if cfg is not None and not mb.config_errors:
+        doctor_collab(mb, cfg, errors, warns, infos)
     res = {"mailbox": slash(root), "errors": errors, "warnings": warns, "info": infos}
     if a.json:
         emit_json(res)
@@ -2880,6 +4932,53 @@ def cmd_doctor(a):
             emit("  错误：" + x)
         emit("结论：%s" % ("有 %d 个错误" % len(errors) if errors else "无错误（注意项 %d 个）" % len(warns)))
     return 1 if errors else 0
+
+
+def doctor_collab(mb, cfg, errors, warns, infos):
+    """通话、队列、通知流、加入申请与权限令牌的体检。"""
+    convs, bad_lines = 0, []
+    for cid in talk_ids(mb):
+        convs += 1
+        try:
+            if talk_meta(mb, cid, fresh=True) is None:
+                errors.append("通话 %s 的元数据读不了" % cid)
+        except CliError as e:
+            errors.append(str(e).split("\n")[0])
+        try:
+            raw = read_bytes_retry(talk_log_path(mb, cid)) or b""
+        except CliError:
+            raw = b""
+        n = len([l for l in raw.split(b"\n") if l.strip()]) - len(jsonl_read(talk_log_path(mb, cid)))
+        if n > 0:
+            bad_lines.append("%s（%d 行）" % (cid, n))
+    if convs:
+        infos.append("通话 %d 个" % convs)
+    if bad_lines:
+        warns.append("通话记录里有看不懂的行（多半是写到一半崩溃留下的残行，已跳过）：%s" % "、".join(bad_lines))
+    now = time.time()
+    for name in queue_names(mb):
+        try:
+            q = read_json_strict(queue_path(mb, name))
+        except CliError as e:
+            errors.append(str(e).split("\n")[0])
+            continue
+        jobs = (q or {}).get("jobs") or []
+        stale = [j["id"] for j in jobs if j.get("status") == "claimed" and (ts_of(j.get("lease_until")) or 0) < now]
+        infos.append("队列 %s：排队 %d，已领 %d" % (name, len([j for j in jobs if j.get("status") == "pending"]),
+                                              len([j for j in jobs if j.get("status") == "claimed"])))
+        if stale:
+            warns.append("队列 %s 里任务 %s 的租约已过期（下次有人操作这个队列时自动收回）" % (
+                name, "、".join("#%d" % x for x in stale)))
+    pend = [r.get("name") for r in requests_all(mb) if r.get("status") == "pending"]
+    if pend:
+        infos.append("待批的加入申请：%s（roster requests 查看）" % "、".join(pend))
+    custom = any(p.get("allow") or p.get("deny") for p in cfg["participants"]) or cfg.get("presets")
+    ctrl = [p for p in cfg["participants"] if p["role"] == "controller" and p["active"]]
+    bare = ([ctrl[0]["name"] + "（主控）"] if ctrl and not ctrl[0].get("token_sha256") else []) + (
+        ["user（用户）"] if not cfg.get("user_token_sha256") else [])
+    if custom and bare:
+        warns.append("已按人设了权限，但 %s 没有身份令牌：能跑命令行的模型可以用 --as 冒充他们绕开权限（perm token <名字> 设令牌）"
+                     % "、".join(bare))
 
 
 def cmd_next(a):
@@ -3079,6 +5178,37 @@ def cmd_selftest(a):
     ok(c == 0, "再加助手（数量可调）", e)
     c, o, e = run("--read-only", "send", "--as", "helper-a", "--subject", "只读", "--body", "x")
     ok(c != 0, "只读模式拒绝投递")
+    c, o, e = run("perm", "revoke", "helper-a", "talk:helper-d", "--as", "helper-c")
+    c2, o2, e2 = run("talk", "call", "helper-d", "--as", "helper-a", "--text", "x", "--wait", "0")
+    ok(c == 0 and c2 != 0 and "权限不足" in e2, "主控按人收回通话权限后即时生效", e or e2)
+    callbuf = {}
+
+    def caller():
+        callbuf["r"] = run("talk", "call", "helper-d", "--as", "helper-c", "--text", "2+2=?", "--wait", "60", "--json",
+                           timeout=120)
+    th = threading.Thread(target=caller)
+    th.start()
+    nxt = None
+    for _ in range(200):
+        c, o, e = run("talk", "next", "--as", "helper-d", "--json")
+        if c == 0:
+            nxt = json.loads(o)
+            break
+        time.sleep(0.3)
+    if nxt:
+        run("talk", "say", nxt["conv"]["id"], "--as", "helper-d", "--text", "4")
+    th.join(150)
+    c, o, e = callbuf.get("r", (None, "", ""))
+    ok(c == 0 and [x["text"] for x in json.loads(o)["replies"]] == ["4"], "通话：呼叫、来电队列接通、回复送回呼叫方", e or o)
+    run("queue", "push", "review", "--as", "helper-c", "--title", "审 1", "--text", "看 diff")
+    c, o, e = run("queue", "take", "review", "--as", "helper-a", "--json")
+    c2, o2, e2 = run("queue", "done", "review", "1", "--as", "helper-a", "--text", "LGTM")
+    c3, o3, e3 = run("notify", "list", "--as", "helper-c", "--json")
+    ok(c == 0 and c2 == 0 and any(x["kind"] == "job-done" for x in json.loads(o3)["items"]),
+       "队列：投放、领取、完成，结果通知回投放者", e or e2 or e3)
+    run("join", "--as", "newbie", "--model", "qwen-3")
+    c, o, e = run("roster", "approve", "newbie", "--as", "helper-c")
+    ok(c == 0 and "newbie" in run("roster")[1], "新模型申请加入，主控批准", e)
     srv = os.path.join(os.path.dirname(me_script), "mcp_server.py")
     if os.path.isfile(srv):
         reqs = [{"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
@@ -3103,7 +5233,7 @@ def cmd_selftest(a):
             if isinstance(m, dict):
                 byid[m.get("id")] = m
         ok(((byid.get(1) or {}).get("result") or {}).get("serverInfo", {}).get("name") == "agent-mailbox"
-           and len(((byid.get(2) or {}).get("result") or {}).get("tools") or []) == 14
+           and len(((byid.get(2) or {}).get("result") or {}).get("tools") or []) == 19
            and "structuredContent" in ((byid.get(3) or {}).get("result") or {}) and "bad" not in byid,
            "MCP 服务：握手、列工具、调工具，stdout 只有协议消息", raw_out[:300].decode("utf-8", "replace"))
     c, o, e = run("doctor")
@@ -3118,7 +5248,7 @@ def cmd_selftest(a):
 
 # ------------------------------------------------------------------ 参数
 GLOBAL_DEFAULTS = {"mailbox": None, "config": None, "state_dir": None, "me": None, "read_only": False,
-                   "json": False}
+                   "json": False, "token_file": None}
 
 
 class Parser(argparse.ArgumentParser):
@@ -3137,6 +5267,8 @@ def build_parser():
     g.add_argument("--config", default=argparse.SUPPRESS, help="花名册文件（默认 <信箱>/.agent-mailbox/config.json）")
     g.add_argument("--state-dir", default=argparse.SUPPRESS, help="控制目录（默认 <信箱>/.agent-mailbox）")
     g.add_argument("--as", dest="me", default=argparse.SUPPRESS, help="本方参与方名（默认环境变量 AGENT_MAILBOX_ME）")
+    g.add_argument("--token-file", default=argparse.SUPPRESS,
+                   help="身份令牌文件（花名册给本方设了令牌时用；也可用环境变量 AGENT_MAILBOX_TOKEN）")
     g.add_argument("--read-only", action="store_true", default=argparse.SUPPRESS, help="只读：不写游标、锁、在线状态，拒绝投递")
     g.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help="输出 JSON")
 
@@ -3206,11 +5338,58 @@ def build_parser():
     r = rs.add_parser("limit", parents=[common], help="设在任助手上限")
     r.add_argument("n", type=int)
     r.set_defaults(func=cmd_roster_limit)
+    r = rs.add_parser("requests", parents=[common], help="加入申请（主控或 roster.admin）")
+    r.add_argument("--all", action="store_true", help="连同已批、已拒的")
+    r.set_defaults(func=cmd_roster_requests)
+    r = rs.add_parser("approve", parents=[common], help="批准加入申请（--allow/--deny 顺带授权只有主控能用）")
+    r.add_argument("name")
+    r.add_argument("--role", choices=("assistant", "observer"), help="默认按申请")
+    r.add_argument("--box", default="", help="收件箱（默认用名字）")
+    r.add_argument("--allow", action="append", help="额外授予的权限（可逗号分隔）")
+    r.add_argument("--deny", action="append", help="收回的权限（可逗号分隔）")
+    r.add_argument("--note", default="")
+    r.set_defaults(func=cmd_roster_decide, op="approve")
+    r = rs.add_parser("reject", parents=[common], help="拒绝加入申请")
+    r.add_argument("name")
+    r.add_argument("--reason", default="")
+    r.set_defaults(func=cmd_roster_decide, op="reject")
     r = rs.add_parser("policy", parents=[common], help="查看或改通信策略")
     r.add_argument("--assistant-to-assistant", choices=("allow", "cc-controller", "deny"))
     r.add_argument("--broadcast", choices=("controller", "anyone"))
     r.add_argument("--inactive-send", choices=("deny", "allow"))
     r.set_defaults(func=cmd_roster_policy)
+
+    s = sp("perm", "权限：查看；授予、收回、重置、改角色预设、发身份令牌（只有主控或用户能改）")
+    ps_ = s.add_subparsers(dest="action", metavar="<动作>")
+    s.set_defaults(func=cmd_perm_show, name=None)
+    r = ps_.add_parser("list", parents=[common], help="权限目录与各角色预设")
+    r.set_defaults(func=cmd_perm_list)
+    r = ps_.add_parser("show", parents=[common], help="有效权限（给名字看某人；不给名字看本方，没有 --as 时列全体在任者）")
+    r.add_argument("name", nargs="?")
+    r.set_defaults(func=cmd_perm_show)
+    r = ps_.add_parser("check", parents=[common], help="判定某人能否用某权限（附依据）")
+    r.add_argument("name")
+    r.add_argument("perm", help="权限键，也可写成 键:范围")
+    r.add_argument("--target", help="对谁（参与方、角色组或队列名）")
+    r.set_defaults(func=cmd_perm_check)
+    for op, help_ in (("grant", "授予权限（同时去掉同名的收回条目）"), ("revoke", "收回权限（显式收回，压过角色预设）"),
+                      ("reset", "去掉显式条目，回到角色预设（不给权限则全部去掉）")):
+        r = ps_.add_parser(op, parents=[common], help=help_)
+        r.add_argument("name")
+        r.add_argument("perms", nargs="*" if op == "reset" else "+", help="权限，如 talk、talk:kimi-1、queue.take:review")
+        r.set_defaults(func=cmd_perm_edit, op=op)
+    r = ps_.add_parser("preset", parents=[common], help="查看或改角色预设")
+    r.add_argument("role", choices=PRESET_ROLES)
+    r.add_argument("--set", help="整体改为这些权限（逗号分隔；空串表示无）")
+    r.add_argument("--add", action="append")
+    r.add_argument("--remove", action="append")
+    r.add_argument("--reset", action="store_true", help="恢复为由通信策略推出的预设")
+    r.set_defaults(func=cmd_perm_preset)
+    r = ps_.add_parser("token", parents=[common], help="给某人（或 user）设身份令牌，防止 --as 冒充")
+    r.add_argument("name", help="参与方名或 user")
+    r.add_argument("--clear", action="store_true", help="清除令牌")
+    r.add_argument("--out", help="把令牌写进这个文件（只有本人可读），而不是打印")
+    r.set_defaults(func=cmd_perm_token)
 
     s = sp("send", "投递一封信（排他编号、现取时间、读回 SHA）")
     s.add_argument("--to", help="收件人：参与方名/别名、controller、all、assistants，可逗号分隔；助手默认写给主控")
@@ -3312,6 +5491,141 @@ def build_parser():
     s.add_argument("--box")
     s.add_argument("--file")
     s.set_defaults(func=cmd_status)
+
+    def text_opts(r, what, required=False):
+        g = r.add_mutually_exclusive_group(required=required)
+        g.add_argument("--text", help=what)
+        g.add_argument("--file", help="从文件读%s（长内容用它，免得 shell 转义）" % what)
+        r.add_argument("--allow-secret", action="store_true", help="确认不是凭据时放行疑似凭据")
+
+    s = sp("notify", "通知：给别人发一条轻量提醒（不占信件编号），或查看本方的通知")
+    ns = s.add_subparsers(dest="action", metavar="<动作>")
+    s.set_defaults(func=cmd_notify_list, all=False, limit=0, peek=False)
+    r = ns.add_parser("send", parents=[common], help="发通知（to 可写名字、controller、assistants、all）")
+    r.add_argument("--to", required=True)
+    text_opts(r, "通知内容（最多 4 KB）", True)
+    r.add_argument("--title", default="")
+    r.add_argument("--urgent", action="store_true")
+    r.set_defaults(func=cmd_notify_send)
+    r = ns.add_parser("list", parents=[common], help="本方通知（默认只列没看过的，并记为已看）")
+    r.add_argument("--all", action="store_true", help="列最近的全部（配 --limit）")
+    r.add_argument("--limit", type=int, default=0)
+    r.add_argument("--peek", action="store_true", help="只看不记为已看")
+    r.set_defaults(func=cmd_notify_list)
+
+    s = sp("talk", "通话：多模型自由对话（一对一或多方）、同步呼叫、来电队列")
+    ts = s.add_subparsers(dest="action", metavar="<动作>")
+    s.set_defaults(func=cmd_talk_list, all=False, everyone=False)
+    r = ts.add_parser("start", parents=[common], help="发起通话（to 可写多人、assistants、all）并发第一句")
+    r.add_argument("--to", required=True)
+    r.add_argument("--topic", default="")
+    text_opts(r, "内容（最多 16 KB）", True)
+    r.add_argument("--urgent", action="store_true")
+    r.add_argument("--wait", type=float, default=0, help="等对方回复的秒数（0 不等）")
+    r.set_defaults(func=cmd_talk_start)
+    r = ts.add_parser("say", parents=[common], help="在通话里发言")
+    r.add_argument("conv", help="通话编号，如 c12（也可只写 12）")
+    text_opts(r, "内容（最多 16 KB）", True)
+    r.add_argument("--reply-to", type=int, help="回复第几条")
+    r.add_argument("--urgent", action="store_true")
+    r.add_argument("--wait", type=float, default=0, help="等别人回复的秒数（0 不等）")
+    r.set_defaults(func=cmd_talk_say)
+    r = ts.add_parser("call", parents=[common], help="呼叫某人：沿用与他的一对一通话（没有就新建），发言并等回复")
+    r.add_argument("who")
+    text_opts(r, "内容（最多 16 KB）", True)
+    r.add_argument("--topic", default="")
+    r.add_argument("--new", action="store_true", help="另起一个新通话")
+    r.add_argument("--urgent", action="store_true", help="紧急：排到对方来电队列最前")
+    r.add_argument("--wait", type=float, default=120, help="等回复的秒数（默认 120，0 不等）")
+    r.set_defaults(func=cmd_talk_call)
+    r = ts.add_parser("read", parents=[common], help="读通话记录（默认最近 50 条），并把读到的记为已看")
+    r.add_argument("conv")
+    r.add_argument("--since", type=int, help="只看第几条之后的")
+    r.add_argument("--unread", action="store_true", help="只看未读")
+    r.add_argument("--limit", type=int, default=50)
+    r.add_argument("--peek", action="store_true", help="只看不记为已看")
+    r.set_defaults(func=cmd_talk_read)
+    r = ts.add_parser("list", parents=[common], help="本方的通话与未读数")
+    r.add_argument("--all", action="store_true", help="连同已结束的")
+    r.add_argument("--everyone", action="store_true", help="信箱里全部通话（要 talk.audit）")
+    r.set_defaults(func=cmd_talk_list)
+    r = ts.add_parser("queue", parents=[common], help="来电队列：等着回复的通话（紧急优先，先来后到）")
+    r.add_argument("--for", dest="who", help="看别人的（要 talk.audit）")
+    r.set_defaults(func=cmd_talk_queue)
+    r = ts.add_parser("next", parents=[common], help="接下一个来电：取队首通话的未读消息并记为已看")
+    r.add_argument("--wait", type=float, default=0, help="队列空时等多少秒")
+    r.add_argument("--peek", action="store_true")
+    r.set_defaults(func=cmd_talk_next)
+    r = ts.add_parser("wait", parents=[common], help="等通话里的新消息")
+    r.add_argument("conv", nargs="?", help="只等这个通话（默认本方全部通话）")
+    r.add_argument("--timeout", type=float, default=600)
+    r.set_defaults(func=cmd_talk_wait)
+    for op, help_ in (("invite", "邀请别人加入通话"), ("leave", "退出通话"), ("close", "结束通话（发起人或主控）")):
+        r = ts.add_parser(op, parents=[common], help=help_)
+        r.add_argument("conv")
+        if op == "invite":
+            r.add_argument("--to", required=True)
+        r.set_defaults(func=cmd_talk_change, op=op)
+
+    s = sp("queue", "工作队列：投任务、排队领取（租约、优先级、到期回收）、等结果")
+    qs = s.add_subparsers(dest="action", metavar="<动作>")
+    s.set_defaults(func=cmd_queue_list)
+    r = qs.add_parser("list", parents=[common], help="全部队列与各状态任务数")
+    r.set_defaults(func=cmd_queue_list)
+    r = qs.add_parser("create", parents=[common], help="建队列或改设置（queue.admin）")
+    r.add_argument("name")
+    r.add_argument("--desc")
+    r.add_argument("--lease", type=int, help="领取后的租约秒数（默认 900，到期没完成就放回排队）")
+    r.add_argument("--max-attempts", type=int, help="最多尝试几次（默认 3）")
+    r.add_argument("--consumers", help="领取名单（逗号分隔；空串表示不限）")
+    r.add_argument("--notify", dest="notify", action="store_const", const=True, default=None, help="新任务通知可领的人（默认）")
+    r.add_argument("--no-notify", dest="notify", action="store_const", const=False, help="新任务不发通知")
+    r.set_defaults(func=cmd_queue_create)
+    r = qs.add_parser("push", parents=[common], help="投任务（queue.push；队列不存在时有 queue.admin 会自动建）")
+    r.add_argument("name")
+    r.add_argument("--title", required=True)
+    text_opts(r, "任务内容（最多 16 KB）")
+    r.add_argument("--priority", type=int, default=0, help="越大越先领")
+    r.add_argument("--to", help="指派给某人（只有他能领）")
+    r.add_argument("--wait", type=float, default=0, help="等任务结束的秒数")
+    r.set_defaults(func=cmd_queue_push)
+    r = qs.add_parser("take", parents=[common], help="领下一个任务（queue.take）；--wait 时排队等")
+    r.add_argument("name")
+    r.add_argument("--wait", type=float, default=0)
+    r.set_defaults(func=cmd_queue_take)
+    for op, help_ in (("done", "完成（--text 写结果）"), ("fail", "记为失败（--retry 还有次数就放回重试）"),
+                      ("release", "做不了，放回排队（不算一次尝试）"), ("renew", "续租"),
+                      ("cancel", "取消（投放者或 queue.admin）")):
+        r = qs.add_parser(op, parents=[common], help=help_)
+        r.add_argument("name")
+        r.add_argument("job", type=int)
+        text_opts(r, "结果" if op == "done" else "说明")
+        if op == "fail":
+            r.add_argument("--retry", action="store_true")
+        r.set_defaults(func=cmd_queue_act, op=op)
+    r = qs.add_parser("show", parents=[common], help="队列里的任务")
+    r.add_argument("name")
+    r.add_argument("--all", action="store_true", help="列出全部已结束的（默认最近 10 个）")
+    r.set_defaults(func=cmd_queue_show)
+    r = qs.add_parser("job", parents=[common], help="一个任务的详情（内容、结果、经过）")
+    r.add_argument("name")
+    r.add_argument("job", type=int)
+    r.set_defaults(func=cmd_queue_job)
+    r = qs.add_parser("wait", parents=[common], help="等任务结束，打印结果")
+    r.add_argument("name")
+    r.add_argument("job", type=int)
+    r.add_argument("--timeout", type=float, default=600)
+    r.set_defaults(func=cmd_queue_wait)
+
+    s = sp("join", "申请加入信箱（--as 写想用的名字），排队等主控批准")
+    s.add_argument("--model", default="")
+    s.add_argument("--harness", default="")
+    s.add_argument("--display", default="")
+    s.add_argument("--note", default="", help="附言：你是谁、能做什么")
+    s.add_argument("--role", choices=("assistant", "observer"), default="assistant")
+    s.add_argument("--wait", type=float, default=0, help="等批准的秒数")
+    s.add_argument("--status", action="store_true", help="只查申请状态")
+    s.set_defaults(func=cmd_join)
 
     s = sp("who", "在线与进度总览：谁在监视、未读、上次发信、任务")
     s.set_defaults(func=cmd_who)

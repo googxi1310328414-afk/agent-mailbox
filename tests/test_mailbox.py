@@ -733,6 +733,483 @@ class ReviewFixesTest(unittest.TestCase):
         self.assertNotIn("Traceback", e)
 
 
+def wait_for(pred, timeout=30, step=0.2):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        r = pred()
+        if r:
+            return r
+        time.sleep(step)
+    return None
+
+
+class PermTest(unittest.TestCase):
+    """主控可分配的权限：角色预设、显式授予与收回、判定规则、代管花名册、身份令牌。"""
+
+    def setUp(self):
+        self.b = Box()
+
+    def tearDown(self):
+        self.b.close()
+
+    def perms(self, name):
+        return self.b.jrun("perm", "show", name)["participants"][0]
+
+    def test_presets_and_explicit_rules(self):
+        b = self.b
+        d = self.perms("helper-a")
+        self.assertEqual(d["preset"], ["send", "notify", "talk", "queue.push", "queue.take", "status"])
+        c, o, e = b.run("send", "--as", "helper-a", "--to", "all", "--subject", "x", "--body", "x")
+        self.assertNotEqual(c, 0)
+        self.assertIn("广播", e)
+        self.assertNotEqual(b.run("perm", "grant", "helper-a", "broadcast", "--as", "helper-b")[0], 0)  # 助手不能授权
+        self.assertEqual(b.run("perm", "grant", "helper-a", "broadcast", "--as", "boss")[0], 0)
+        self.assertEqual(b.run("send", "--as", "helper-a", "--to", "all", "--subject", "x", "--body", "x")[0], 0)
+        # 点名收回只挡被点名的人
+        self.assertEqual(b.run("perm", "revoke", "helper-a", "send:helper-c", "--as", "boss")[0], 0)
+        c, o, e = b.run("send", "--as", "helper-a", "--to", "helper-c", "--subject", "x", "--body", "x")
+        self.assertEqual(c, 2)
+        self.assertIn("perm grant helper-a send:helper-c", e)
+        self.assertEqual(b.run("send", "--as", "helper-a", "--to", "helper-b", "--subject", "x", "--body", "x")[0], 0)
+        # 最具体的一条说了算：整体收回 send，再点名授予 helper-c
+        b.run("perm", "revoke", "helper-a", "send", "--as", "boss")
+        b.run("perm", "grant", "helper-a", "send:helper-c", "--as", "boss")
+        chk = lambda who, perm, tgt=None: b.jrun(*(["perm", "check", who, perm] + (["--target", tgt] if tgt else [])))["allowed"]
+        self.assertTrue(chk("helper-a", "send", "helper-c"))
+        self.assertFalse(chk("helper-a", "send", "helper-b"))
+        self.assertFalse(chk("helper-a", "send", "boss"))
+        # 角色组比不限范围具体；同样具体时收回优先
+        b.run("perm", "grant", "helper-b", "talk:@controller", "--as", "boss")
+        b.run("perm", "revoke", "helper-b", "talk", "--as", "boss")
+        self.assertTrue(chk("helper-b", "talk", "boss"))
+        self.assertFalse(chk("helper-b", "talk", "helper-c"))
+        b.run("perm", "grant", "helper-c", "status", "--as", "boss")
+        b.run("perm", "revoke", "helper-c", "*", "--as", "boss")
+        self.assertFalse(chk("helper-c", "status"))
+        self.assertEqual(b.run("perm", "reset", "helper-c", "--as", "boss")[0], 0)
+        d = self.perms("helper-c")
+        self.assertEqual((d["allow"], d["deny"]), ([], []))
+        self.assertTrue(chk("helper-c", "status"))
+        self.assertNotEqual(b.run("perm", "grant", "helper-c", "talk:nobody", "--as", "boss")[0], 0)  # 点名的人须在花名册
+        self.assertNotEqual(b.run("perm", "grant", "helper-c", "fly", "--as", "boss")[0], 0)
+        self.assertNotEqual(b.run("perm", "grant", "boss", "talk", "--as", "boss")[0], 0)  # 主控本就全有
+        # 改权限会通知本人
+        feed = b.jrun("notify", "list", "--as", "helper-a")
+        self.assertTrue(any(x["kind"] == "perm" for x in feed["items"]))
+        self.assertEqual(b.jrun("notify", "list", "--as", "helper-a")["unseen"], 0)  # 列过即记为已看
+
+    def test_policy_feeds_presets_and_observer(self):
+        b = self.b
+        b.run("roster", "policy", "--as", "boss", "--assistant-to-assistant", "deny", "--broadcast", "anyone")
+        d = self.perms("helper-b")
+        self.assertIn("send:@controller", d["preset"])
+        self.assertIn("broadcast", d["preset"])
+        self.assertNotIn("send", d["preset"])
+        c, o, e = b.run("send", "--as", "helper-b", "--to", "helper-c", "--subject", "x", "--body", "x")
+        self.assertEqual(c, 2)
+        self.assertIn("policy.assistant_to_assistant=deny", e)
+        self.assertEqual(b.run("send", "--as", "helper-b", "--to", "boss", "--subject", "x", "--body", "x")[0], 0)
+        b.run("perm", "grant", "helper-b", "send:helper-c", "--as", "boss")  # 主控按人放开
+        self.assertEqual(b.run("send", "--as", "helper-b", "--to", "helper-c", "--subject", "x", "--body", "x")[0], 0)
+        self.assertEqual(b.run("roster", "add", "obs", "--as", "boss", "--role", "observer")[0], 0)
+        c, o, e = b.run("send", "--as", "obs", "--to", "boss", "--subject", "x", "--body", "x")
+        self.assertEqual(c, 2)
+        self.assertIn("权限不足", e)
+        b.run("perm", "preset", "observer", "--add", "send:@controller", "--as", "boss")
+        self.assertEqual(b.run("send", "--as", "obs", "--to", "boss", "--subject", "x", "--body", "x")[0], 0)
+        self.assertIn("send:@controller", b.jrun("perm", "list")["presets"]["observer"])
+        b.run("perm", "preset", "observer", "--reset", "--as", "boss")
+        self.assertEqual(b.jrun("perm", "list")["presets"]["observer"], ["talk.audit"])
+        self.assertNotEqual(b.run("status", "put", "RUN-1", "--as", "obs", stdin=b'{"a": 1}')[0], 0)
+        b.run("perm", "revoke", "helper-a", "status", "--as", "boss")
+        self.assertNotEqual(b.run("status", "put", "RUN-1", "--as", "helper-a", stdin=b'{"a": 1}')[0], 0)
+        self.assertEqual(b.run("status", "put", "RUN-1", "--as", "helper-b", stdin=b'{"a": 1}')[0], 0)
+
+    def test_roster_admin_delegation(self):
+        b = self.b
+        self.assertNotEqual(b.run("roster", "add", "x1", "--as", "helper-a")[0], 0)
+        b.run("perm", "grant", "helper-a", "roster.admin", "--as", "boss")
+        self.assertEqual(b.run("roster", "add", "x1", "--as", "helper-a", "--model", "m")[0], 0)
+        self.assertEqual(b.run("roster", "update", "x1", "--as", "helper-a", "--display", "X1")[0], 0)
+        self.assertNotEqual(b.run("roster", "update", "boss", "--as", "helper-a", "--display", "B")[0], 0)  # 不能改主控
+        self.assertNotEqual(b.run("perm", "grant", "x1", "broadcast", "--as", "helper-a")[0], 0)  # 不能授权
+        self.assertNotEqual(b.run("roster", "handover", "helper-a", "--as", "helper-a")[0], 0)
+        self.assertNotEqual(b.run("roster", "policy", "--as", "helper-a", "--broadcast", "anyone")[0], 0)
+        self.assertEqual(b.run("roster", "remove", "x1", "--as", "helper-a")[0], 0)
+
+    def test_identity_tokens(self):
+        b = self.b
+        tok, utok = os.path.join(b.dir, "boss.tok"), os.path.join(b.dir, "user.tok")
+        self.assertEqual(b.run("perm", "token", "boss", "--as", "boss", "--out", tok)[0], 0)
+        if os.name != "nt":
+            self.assertEqual(os.stat(tok).st_mode & 0o777, 0o600)
+        secret = slurp(tok).decode("utf-8").strip()
+        self.assertRegex(secret, r"^amb_[0-9a-f]{40}$")
+        c, o, e = b.run("inbox", "--as", "boss")
+        self.assertEqual(c, 2)
+        self.assertIn("令牌", e)
+        self.assertNotIn(secret, e)
+        self.assertEqual(b.run("inbox", "--as", "boss", "--token-file", tok)[0], 0)
+        self.assertEqual(b.run("inbox", "--as", "boss", env=dict(b.env, AGENT_MAILBOX_TOKEN=secret))[0], 0)
+        self.assertEqual(b.run("inbox", "--as", "boss", env=dict(b.env, AGENT_MAILBOX_TOKEN="amb_" + "0" * 40))[0], 2)
+        self.assertTrue([p for p in b.jrun("roster")["participants"] if p["name"] == "boss"][0]["token"])
+        self.assertNotIn(secret, slurp(os.path.join(b.mb, ".agent-mailbox", "config.json")).decode("utf-8"))
+        for args in (["send", "--as", "helper-a", "--subject", "x", "--body", "令牌 " + secret],
+                     ["notify", "send", "--as", "helper-a", "--to", "boss", "--text", secret],
+                     ["talk", "call", "boss", "--as", "helper-a", "--text", secret, "--wait", "0"]):
+            c, o, e = b.run(*args)
+            self.assertEqual(c, 2, args)
+            self.assertIn("凭据", e, args)
+        b.run("perm", "grant", "helper-a", "talk:helper-b", "--as", "boss", "--token-file", tok)
+        self.assertIn("没有身份令牌", " ".join(b.jrun("doctor")["warnings"]))  # 用户还没令牌
+        self.assertEqual(b.run("perm", "token", "user", "--as", "boss", "--token-file", tok, "--out", utok)[0], 0)
+        self.assertEqual(b.run("perm", "grant", "helper-a", "broadcast", "--as", "user")[0], 2)
+        self.assertEqual(b.run("perm", "grant", "helper-a", "broadcast", "--as", "user", "--token-file", utok)[0], 0)
+        self.assertNotIn("没有身份令牌", " ".join(b.jrun("doctor")["warnings"]))
+        self.assertEqual(b.run("perm", "token", "boss", "--clear", "--as", "boss", "--token-file", tok)[0], 0)
+        self.assertEqual(b.run("inbox", "--as", "boss")[0], 0)
+
+
+class NotifyTest(unittest.TestCase):
+    def setUp(self):
+        self.b = Box()
+
+    def tearDown(self):
+        self.b.close()
+
+    def test_send_list_seen_and_rules(self):
+        b = self.b
+        r = b.jrun("notify", "send", "--as", "boss", "--to", "assistants", "--text", "今晚开会", "--title", "会议", "--urgent")
+        self.assertEqual(sorted(x["to"] for x in r["sent"]), ["helper-a", "helper-b", "helper-c"])
+        d = b.jrun("notify", "list", "--as", "helper-b", "--peek")
+        self.assertEqual(d["unseen"], 1)
+        self.assertEqual((d["items"][0]["title"], d["items"][0]["urgent"], d["items"][0]["from"]), ("会议", True, "boss"))
+        self.assertEqual(b.jrun("notify", "list", "--as", "helper-b")["unseen"], 1)
+        self.assertEqual(b.jrun("notify", "list", "--as", "helper-b")["unseen"], 0)
+        self.assertEqual(len(b.jrun("notify", "list", "--as", "helper-b", "--all")["items"]), 1)
+        c, o, e = b.run("notify", "send", "--as", "helper-a", "--to", "all", "--text", "x")
+        self.assertEqual(c, 2)
+        self.assertIn("broadcast", e)
+        self.assertEqual(b.run("notify", "send", "--as", "helper-a", "--to", "helper-a", "--text", "x")[0], 2)
+        self.assertEqual(b.run("notify", "send", "--as", "helper-a", "--to", "helper-b", "--text", "坏" + chr(0xFFFD))[0], 2)
+        big = os.path.join(b.dir, "big.txt")
+        with open(big, "wb") as f:
+            f.write(b"x" * 5000)
+        c, o, e = b.run("notify", "send", "--as", "helper-a", "--to", "helper-b", "--file", big)
+        self.assertEqual(c, 2)
+        self.assertIn("超过上限", e)
+        for i in range(5):
+            b.run("notify", "send", "--as", "boss", "--to", "helper-c", "--text", "第 %d 条" % i)
+        d = b.jrun("notify", "list", "--as", "helper-c", "--limit", "2")
+        self.assertEqual([x["text"] for x in d["items"]], ["今晚开会", "第 0 条"])  # 先列最早的，后面的留到下次
+        self.assertEqual(b.jrun("notify", "list", "--as", "helper-c", "--peek")["unseen"], 4)
+        b.run("roster", "policy", "--as", "boss", "--assistant-to-assistant", "cc-controller")
+        r = b.jrun("notify", "send", "--as", "helper-a", "--to", "helper-b", "--text", "抄送测试")
+        self.assertEqual(sorted((x["to"], x["cc"]) for x in r["sent"]), [("boss", True), ("helper-b", False)])
+
+    def test_concurrent_pushes_keep_unique_seq(self):
+        b = self.b
+        procs = [b.popen("notify", "send", "--as", "helper-%s" % "ab"[i % 2], "--to", "boss", "--text", "并发 %d" % i)
+                 for i in range(8)]
+        for p in procs:
+            p.communicate(timeout=120)
+        self.assertTrue(all(p.returncode == 0 for p in procs))
+        items = b.jrun("notify", "list", "--as", "boss", "--peek")["items"]
+        self.assertEqual(sorted(x["seq"] for x in items), list(range(1, 9)))
+        self.assertEqual(sorted(x["text"] for x in items), sorted("并发 %d" % i for i in range(8)))
+
+
+class TalkTest(unittest.TestCase):
+    def setUp(self):
+        self.b = Box()
+
+    def tearDown(self):
+        self.b.close()
+
+    def test_call_reply_queue_and_reading(self):
+        b = self.b
+        p = b.popen("talk", "call", "helper-c", "--as", "helper-a", "--text", "在吗？\n第二行", "--wait", "60", "--json")
+        q = wait_for(lambda: b.jrun("talk", "queue", "--as", "helper-c")["queue"], 60)
+        self.assertEqual((q[0]["conv"], q[0]["from"], q[0]["count"]), ("c1", "helper-a", 1))
+        nx = b.jrun("talk", "next", "--as", "helper-c")
+        self.assertEqual(nx["messages"][0]["text"], "在吗？\n第二行")
+        self.assertEqual(b.jrun("talk", "queue", "--as", "helper-c")["queue"], [])
+        self.assertEqual(b.run("talk", "say", "c1", "--as", "helper-c", "--text", "在，请讲", "--reply-to", "1")[0], 0)
+        out, err = p.communicate(timeout=90)
+        self.assertEqual(p.returncode, 0, err.decode("utf-8", "replace"))
+        r = json.loads(out.decode("utf-8"))
+        self.assertTrue(r["created"])
+        self.assertEqual([(x["from"], x["text"], x.get("reply_to")) for x in r["replies"]], [("helper-c", "在，请讲", 1)])
+        self.assertEqual(r["conv"]["members"], ["helper-a", "helper-c"])
+        # 再呼叫沿用同一个一对一通话，超时返回码 3
+        c, o, e = b.run("talk", "call", "helper-c", "--as", "helper-a", "--text", "还在吗", "--wait", "1", "--json")
+        self.assertEqual(c, 3, e)
+        self.assertEqual(json.loads(o)["conv"]["id"], "c1")
+        self.assertEqual(json.loads(o)["queue_position"], {"helper-c": 1})
+        # 来电队列：紧急的排前面，其余先来后到
+        b.run("talk", "call", "helper-c", "--as", "helper-b", "--text", "普通来电", "--wait", "0")
+        b.run("talk", "call", "helper-c", "--as", "boss", "--text", "紧急来电", "--wait", "0", "--urgent")
+        q = b.jrun("talk", "queue", "--as", "helper-c")["queue"]
+        self.assertEqual([x["from"] for x in q], ["boss", "helper-a", "helper-b"])
+        self.assertTrue(q[0]["urgent"])
+        # 读权限：成员、主控、有 talk.audit 的旁听者可读，别人不行
+        self.assertNotEqual(b.run("talk", "read", "c1", "--as", "helper-b")[0], 0)
+        self.assertEqual(b.run("talk", "read", "c1", "--as", "boss")[0], 0)
+        b.run("roster", "add", "obs", "--as", "boss", "--role", "observer")
+        self.assertEqual(b.jrun("talk", "read", "c1", "--as", "obs")["total"], 3)
+        self.assertNotEqual(b.run("talk", "say", "c1", "--as", "obs", "--text", "插话")[0], 0)
+        lst = b.jrun("talk", "list", "--as", "helper-c")["conversations"]
+        self.assertEqual(sorted(x["id"] for x in lst), ["c1", "c2", "c3"])
+        self.assertEqual(sum(x["unread"] for x in lst), 3)
+        self.assertEqual(len(b.jrun("talk", "list", "--as", "boss", "--everyone")["conversations"]), 3)
+        self.assertNotEqual(b.run("talk", "list", "--as", "helper-a", "--everyone")[0], 0)
+
+    def test_membership_permissions_and_lifecycle(self):
+        b = self.b
+        r = b.jrun("talk", "start", "--as", "boss", "--to", "helper-a,helper-b", "--topic", "评审", "--text", "开始")
+        cid = r["conv"]["id"]
+        self.assertEqual(r["conv"]["members"], ["boss", "helper-a", "helper-b"])
+        self.assertEqual(b.run("talk", "say", cid, "--as", "helper-a", "--text", "收到")[0], 0)
+        self.assertNotEqual(b.run("talk", "say", cid, "--as", "helper-c", "--text", "旁人插话")[0], 0)  # 不是成员
+        b.run("perm", "revoke", "helper-a", "talk:helper-b", "--as", "boss")
+        c, o, e = b.run("talk", "say", cid, "--as", "helper-a", "--text", "还能说吗")
+        self.assertEqual(c, 2)
+        self.assertIn("talk:helper-b", e)  # 发言要对每个在任成员都有权限
+        self.assertEqual(b.run("talk", "invite", cid, "--as", "helper-b", "--to", "helper-c")[0], 0)
+        self.assertEqual(b.jrun("talk", "read", cid, "--as", "helper-c", "--unread")["messages"][-1]["kind"], "join")
+        self.assertEqual(b.run("talk", "leave", cid, "--as", "helper-b")[0], 0)
+        self.assertNotIn("helper-b", b.jrun("talk", "read", cid, "--as", "boss")["conv"]["members"])
+        self.assertEqual(b.run("talk", "say", cid, "--as", "helper-a", "--text", "b 走了，我能说了")[0], 0)
+        self.assertNotEqual(b.run("talk", "close", cid, "--as", "helper-a")[0], 0)  # 只有发起人或主控
+        self.assertEqual(b.run("talk", "close", cid, "--as", "boss")[0], 0)
+        c, o, e = b.run("talk", "say", cid, "--as", "helper-a", "--text", "结束后")
+        self.assertEqual(c, 2)
+        self.assertIn("已结束", e)
+        # 主控在不是成员的通话里发言会自动加入
+        r = b.jrun("talk", "start", "--as", "helper-a", "--to", "helper-c", "--text", "私聊")
+        self.assertEqual(b.run("talk", "say", r["conv"]["id"], "--as", "boss", "--text", "主控插一句")[0], 0)
+        self.assertIn("boss", b.jrun("talk", "read", r["conv"]["id"], "--as", "boss")["conv"]["members"])
+        # cc-controller：助手之间的通话自动带上主控；deny：助手之间不能通话
+        b.run("roster", "policy", "--as", "boss", "--assistant-to-assistant", "cc-controller")
+        r = b.jrun("talk", "start", "--as", "helper-b", "--to", "helper-c", "--text", "抄送主控")
+        self.assertIn("boss", r["conv"]["members"])
+        r2 = b.jrun("talk", "call", "helper-c", "--as", "helper-b", "--text", "沿用", "--wait", "0")
+        self.assertEqual(r2["conv"]["id"], r["conv"]["id"])
+        b.run("roster", "policy", "--as", "boss", "--assistant-to-assistant", "deny")
+        c, o, e = b.run("talk", "call", "helper-c", "--as", "helper-b", "--text", "x", "--wait", "0")
+        self.assertEqual(c, 2)
+        self.assertIn("policy.assistant_to_assistant=deny", e)
+        self.assertEqual(b.run("talk", "call", "boss", "--as", "helper-b", "--text", "找主控", "--wait", "0")[0], 0)
+
+    def test_concurrent_posts_get_unique_seq(self):
+        b = self.b
+        cid = b.jrun("talk", "start", "--as", "boss", "--to", "assistants", "--text", "并发开始")["conv"]["id"]
+        procs = [b.popen("talk", "say", cid, "--as", "helper-%s" % "abc"[i % 3], "--text", "并发 %d" % i) for i in range(9)]
+        for p in procs:
+            p.communicate(timeout=120)
+        self.assertTrue(all(p.returncode == 0 for p in procs))
+        msgs = b.jrun("talk", "read", cid, "--as", "boss", "--limit", "100")["messages"]
+        self.assertEqual([x["seq"] for x in msgs], list(range(1, 11)))
+        self.assertEqual(sorted(x["text"] for x in msgs[1:]), sorted("并发 %d" % i for i in range(9)))
+        # 崩溃留下的残行：跳过且不重号
+        with open(os.path.join(b.mb, ".agent-mailbox", "talk", cid + ".jsonl"), "ab") as f:
+            f.write(b'{"seq": 11, "from": "boss", "te')
+        self.assertEqual(b.jrun("talk", "say", cid, "--as", "boss", "--text", "残行之后")["message"]["seq"], 11)
+        self.assertEqual(b.jrun("talk", "read", cid, "--as", "boss", "--limit", "100")["messages"][-1]["text"], "残行之后")
+        self.assertIn("残行", " ".join(b.jrun("doctor")["warnings"]))
+
+
+class QueueTest(unittest.TestCase):
+    def setUp(self):
+        self.b = Box()
+
+    def tearDown(self):
+        self.b.close()
+
+    def qpath(self, name):
+        return os.path.join(self.b.mb, ".agent-mailbox", "queues", name + ".json")
+
+    def test_priority_assignment_and_lifecycle(self):
+        b = self.b
+        self.assertNotEqual(b.run("queue", "push", "review", "--as", "helper-a", "--title", "x")[0], 0)  # 助手不能建队列
+        self.assertEqual(b.run("queue", "create", "review", "--as", "boss", "--desc", "代码评审")[0], 0)
+        for args in (["--title", "低优先"], ["--title", "高优先", "--priority", "5"], ["--title", "指派给 b", "--to", "helper-b"]):
+            self.assertEqual(b.run(*(["queue", "push", "review", "--as", "boss", "--text", "详情"] + args))[0], 0)
+        self.assertEqual(b.jrun("queue", "show", "review")["pending"][0]["title"], "高优先")
+        notes = b.jrun("notify", "list", "--as", "helper-a", "--peek")["items"]
+        self.assertEqual(len([x for x in notes if x["kind"] == "job"]), 2)  # 指派给 b 的不通知 a
+        j1 = b.jrun("queue", "take", "review", "--as", "helper-a")
+        self.assertEqual((j1["title"], j1["status"], j1["attempts"]), ("高优先", "claimed", 1))
+        j2 = b.jrun("queue", "take", "review", "--as", "helper-a")
+        self.assertEqual(j2["title"], "低优先")  # 指派给 b 的跳过
+        self.assertEqual(b.run("queue", "take", "review", "--as", "helper-a")[0], 3)
+        self.assertEqual(b.jrun("queue", "take", "review", "--as", "helper-b")["title"], "指派给 b")
+        self.assertNotEqual(b.run("queue", "done", "review", str(j1["id"]), "--as", "helper-b")[0], 0)  # 不是自己领的
+        self.assertEqual(b.run("queue", "done", "review", str(j1["id"]), "--as", "helper-a", "--text", "LGTM")[0], 0)
+        done = [x for x in b.jrun("notify", "list", "--as", "boss")["items"] if x["kind"] == "job-done"]
+        self.assertIn("LGTM", done[0]["text"])
+        self.assertEqual(b.jrun("queue", "job", "review", str(j1["id"]))["result"], "LGTM")
+        self.assertEqual(b.run("queue", "fail", "review", str(j2["id"]), "--as", "helper-a", "--text", "依赖挂了", "--retry")[0], 0)
+        j = b.jrun("queue", "job", "review", str(j2["id"]))
+        self.assertEqual((j["status"], j["error"]), ("pending", "依赖挂了"))
+        self.assertEqual(b.jrun("queue", "take", "review", "--as", "helper-c")["id"], j2["id"])
+        self.assertEqual(b.run("queue", "release", "review", str(j2["id"]), "--as", "helper-c")[0], 0)
+        self.assertEqual(b.jrun("queue", "job", "review", str(j2["id"]))["attempts"], 1)  # 放回不算一次尝试
+        b.jrun("queue", "take", "review", "--as", "helper-c")
+        self.assertNotEqual(b.run("queue", "cancel", "review", str(j2["id"]), "--as", "helper-a")[0], 0)  # 不是投放者
+        self.assertEqual(b.run("queue", "cancel", "review", str(j2["id"]), "--as", "boss", "--text", "不用了")[0], 0)
+        self.assertTrue(any("取消" in x["text"] for x in b.jrun("notify", "list", "--as", "helper-c")["items"]))
+        lst = b.jrun("queue", "list")["queues"][0]
+        self.assertEqual((lst["done"], lst["cancelled"], lst["claimed"]), (1, 1, 1))
+        # 领取名单与按队列收回权限
+        b.run("queue", "create", "build", "--as", "boss", "--consumers", "helper-a")
+        b.run("queue", "push", "build", "--as", "boss", "--title", "编译")
+        self.assertNotEqual(b.run("queue", "take", "build", "--as", "helper-b")[0], 0)
+        b.run("perm", "revoke", "helper-a", "queue.take:build", "--as", "boss")
+        c, o, e = b.run("queue", "take", "build", "--as", "helper-a")
+        self.assertEqual(c, 2)
+        self.assertIn("queue.take:build", e)
+        self.assertEqual(b.run("queue", "push", "nope", "--as", "helper-a", "--title", "x")[0], 2)  # 不存在且无 queue.admin
+
+    def test_lease_expiry_and_max_attempts(self):
+        b = self.b
+        b.run("queue", "create", "jobs", "--as", "boss", "--max-attempts", "2")
+        b.run("queue", "push", "jobs", "--as", "boss", "--title", "会超时的活")
+
+        def expire():
+            q = json.loads(slurp(self.qpath("jobs")).decode("utf-8"))
+            for j in q["jobs"]:
+                if j["status"] == "claimed":
+                    j["lease_until"] = "2020-01-01T00:00:00Z"
+            with open(self.qpath("jobs"), "wb") as f:
+                f.write(json.dumps(q).encode("utf-8"))
+        self.assertEqual(b.jrun("queue", "take", "jobs", "--as", "helper-a")["attempts"], 1)
+        expire()
+        self.assertEqual(b.jrun("queue", "show", "jobs")["pending"][0]["title"], "会超时的活")  # 只读查看也按到期算
+        self.assertIn("租约", b.jrun("doctor")["warnings"][0])
+        c, o, e = b.run("queue", "done", "jobs", "1", "--as", "helper-a")
+        self.assertEqual(c, 2)
+        self.assertIn("租约", e)
+        self.assertEqual(b.jrun("queue", "take", "jobs", "--as", "helper-b")["attempts"], 2)
+        expire()
+        self.assertEqual(b.run("queue", "take", "jobs", "--as", "helper-c")[0], 3)  # 已用完尝试次数
+        j = b.jrun("queue", "job", "jobs", "1")
+        self.assertEqual(j["status"], "failed")
+        self.assertIn("租约到期", j["error"])
+        self.assertTrue(any(x["kind"] == "job-failed" for x in b.jrun("notify", "list", "--as", "boss")["items"]))
+
+    def test_blocking_take_and_push_wait(self):
+        b = self.b
+        b.run("queue", "create", "work", "--as", "boss")
+        p = b.popen("queue", "take", "work", "--as", "helper-a", "--wait", "60", "--json")
+        time.sleep(1.5)
+        b.run("queue", "push", "work", "--as", "boss", "--title", "排队等到的活")
+        out, err = p.communicate(timeout=90)
+        self.assertEqual(p.returncode, 0, err.decode("utf-8", "replace"))
+        self.assertEqual(json.loads(out.decode("utf-8"))["title"], "排队等到的活")
+        p = b.popen("queue", "push", "work", "--as", "boss", "--title", "等结果的活", "--wait", "60", "--json")
+        def take():
+            c, o, e = b.run("queue", "take", "work", "--as", "helper-b", "--json")
+            return json.loads(o) if c == 0 else None
+        jid = wait_for(take, 60)["id"]
+        b.run("queue", "done", "work", str(jid), "--as", "helper-b", "--text", "结果在 /tmp/out")
+        out, err = p.communicate(timeout=90)
+        self.assertEqual(p.returncode, 0, err.decode("utf-8", "replace"))
+        r = json.loads(out.decode("utf-8"))
+        self.assertEqual((r["status"], r["result"]), ("done", "结果在 /tmp/out"))
+        self.assertEqual(b.run("queue", "take", "work", "--as", "helper-a", "--wait", "1")[0], 3)
+
+    def test_concurrent_takes_never_double_claim(self):
+        b = self.b
+        b.run("queue", "create", "pool", "--as", "boss")
+        for i in range(6):
+            b.run("queue", "push", "pool", "--as", "boss", "--title", "活 %d" % i)
+        procs = [b.popen("queue", "take", "pool", "--as", "helper-%s" % "abc"[i % 3], "--json") for i in range(8)]
+        outs = [p.communicate(timeout=120) for p in procs]
+        got = [json.loads(o.decode("utf-8")) for o, _ in outs]
+        ids = [g["id"] for g in got if not g.get("empty")]
+        self.assertEqual(sorted(ids), [1, 2, 3, 4, 5, 6])
+        self.assertEqual(len([g for g in got if g.get("empty")]), 2)
+        self.assertEqual([p.returncode for p in procs].count(3), 2)
+
+
+class JoinTest(unittest.TestCase):
+    def setUp(self):
+        self.b = Box()
+
+    def tearDown(self):
+        self.b.close()
+
+    def test_join_approve_reject_and_rejoin(self):
+        b = self.b
+        self.assertEqual(b.run("join", "--as", "kimi-9", "--model", "kimi-k2", "--note", "我能写测试")[0], 0)
+        st = b.jrun("join", "--as", "kimi-9", "--status")
+        self.assertEqual((st["in_roster"], st["request"]["status"]), (False, "pending"))
+        self.assertEqual(b.run("inbox", "--as", "kimi-9")[0], 2)
+        n = b.jrun("notify", "list", "--as", "boss")["items"]
+        self.assertTrue(any(x["kind"] == "join" and "kimi-9" in x["text"] for x in n))
+        b.run("join", "--as", "kimi-9", "--model", "kimi-k2", "--note", "我能写测试")  # 重复申请不重复通知
+        self.assertEqual(b.jrun("notify", "list", "--as", "boss")["unseen"], 0)
+        self.assertNotEqual(b.run("roster", "requests", "--as", "helper-a")[0], 0)
+        self.assertEqual([r["name"] for r in b.jrun("roster", "requests", "--as", "boss")["requests"]], ["kimi-9"])
+        self.assertEqual(b.run("roster", "approve", "kimi-9", "--as", "boss", "--allow", "broadcast,talk:boss")[0], 0)
+        p = [x for x in b.jrun("roster")["participants"] if x["name"] == "kimi-9"][0]
+        self.assertEqual((p["role"], p["active"], p["model"], p["allow"]), ("assistant", True, "kimi-k2", ["broadcast", "talk:boss"]))
+        self.assertTrue(any(x["kind"] == "joined" for x in b.jrun("notify", "list", "--as", "kimi-9")["items"]))
+        self.assertIn("已在花名册", b.run("join", "--as", "kimi-9")[1])
+        self.assertEqual(b.run("join", "--as", "spam", "--model", "x")[0], 0)
+        r = b.run("roster", "reject", "spam", "--as", "boss", "--reason", "不认识")
+        self.assertEqual(r[0], 0, r)
+        c, o, e = b.run("join", "--as", "spam", "--status")
+        self.assertIn("rejected", o)
+        self.assertEqual(b.run("roster", "approve", "spam", "--as", "boss")[0], 2)  # 已拒，不能再批
+        b.run("perm", "grant", "helper-a", "roster.admin", "--as", "boss")
+        b.run("join", "--as", "grok-1", "--model", "grok-4")
+        self.assertNotEqual(b.run("roster", "approve", "grok-1", "--as", "helper-a", "--allow", "broadcast")[0], 0)
+        self.assertEqual(b.run("roster", "approve", "grok-1", "--as", "helper-a")[0], 0)  # 代管者能批但不能授权
+        # 前任重新申请：批准后回到在任，箱里的历史信记为已读
+        b.run("send", "--as", "boss", "--to", "helper-c", "--subject", "旧信", "--body", "x")
+        b.run("roster", "remove", "helper-c", "--as", "boss")
+        p = b.popen("join", "--as", "helper-c", "--model", "glm", "--wait", "60")
+        wait_for(lambda: b.jrun("roster", "requests", "--as", "boss")["requests"], 60)
+        self.assertEqual(b.run("roster", "approve", "helper-c", "--as", "boss")[0], 0)
+        out, err = p.communicate(timeout=90)
+        self.assertEqual(p.returncode, 0, out.decode("utf-8", "replace") + err.decode("utf-8", "replace"))
+        self.assertIn("已获批准", out.decode("utf-8", "replace"))
+        self.assertEqual(b.jrun("inbox", "--as", "helper-c")["unread"], 0)
+
+
+class CollabWatchTest(unittest.TestCase):
+    def setUp(self):
+        self.b = Box()
+
+    def tearDown(self):
+        self.b.close()
+
+    def test_watch_reports_talk_and_notify_once(self):
+        b = self.b
+        p = b.popen("watch", "--as", "helper-c", "--once", "--seconds", "30", "--interval", "0.2", "--coalesce", "0.5")
+        time.sleep(1.5)
+        b.run("talk", "call", "helper-c", "--as", "helper-a", "--text", "第一行\n第二行", "--wait", "0")
+        b.run("notify", "send", "--as", "boss", "--to", "helper-c", "--text", "请看 c1", "--urgent")
+        out, err = p.communicate(timeout=60)
+        out = out.decode("utf-8", "replace")
+        self.assertEqual(p.returncode, 0, out + err.decode("utf-8", "replace"))
+        self.assertIn("TALK c1", out)
+        self.assertIn("    第二行", out)
+        self.assertIn("NOTIFY [急]#1", out)
+        c, o, e = b.run("watch", "--as", "helper-c", "--once", "--seconds", "1", "--interval", "0.2")
+        self.assertEqual(c, 3, o)  # 已报过的不再报，并且算作看过
+        self.assertEqual(b.jrun("talk", "list", "--as", "helper-c")["conversations"][0]["unread"], 0)
+        self.assertEqual(b.jrun("notify", "list", "--as", "helper-c", "--peek")["unseen"], 0)
+        b.run("talk", "say", "c1", "--as", "helper-a", "--text", "间隙里的话")
+        c, o, e = b.run("watch", "--as", "helper-c", "--once", "--seconds", "20", "--interval", "0.2", "--json")
+        self.assertEqual(c, 0, o + e)
+        ev = [json.loads(l) for l in o.splitlines() if l.strip()]
+        self.assertEqual([(x["kind"], x["conv"], x["seq"]) for x in ev if x["kind"] == "TALK"], [("TALK", "c1", 2)])
+        self.assertEqual(b.jrun("who")[2]["talk_unread"], 0)
+
+
 class InstallTest(unittest.TestCase):
     def test_install_dedupe_force_backup(self):
         home = tempfile.mkdtemp(prefix="amb-home-")

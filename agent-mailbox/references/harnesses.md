@@ -5,9 +5,9 @@
 ## 首选：接 MCP 服务
 
 支持 MCP 的客户端，包括 Claude Code、Codex、Pi、Cursor、Kimi、Gemini CLI 等，最省事的做法是接 `scripts/mcp_server.py`（配置见 `mcp.md`）：
-- 身份在启动时绑定一次；
-- 等回信用 `mailbox_wait`；
-- 来信会附在工具结果里，或经通知推送；
+- 身份在启动时绑定一次；新模型加 `--join` 就能申请加入，主控批准后自动开始收信；
+- 等回信、回话用 `mailbox_wait`，问别的模型并等它回答用 `mailbox_call`；
+- 来信、通话消息、通知会附在工具结果里，或经通知推送；
 - Claude Code 以频道方式加载时直接注入会话。
 
 下文是不接 MCP 时的做法。
@@ -29,6 +29,7 @@ python -I -B "<skill>/scripts/mailbox.py" --mailbox "<信箱>" --as <名> watch 
 ```
 
 - 唤醒后：读输出里的 `MAIL` 行 → `read <编号>` 读原信 → 处理 → **立刻重挂**。重挂间隙到的信不会丢，下次照报。
+- `TALK` 行是通话消息（已附全文），用 `talk say <通话> --text …` 回复；`NOTIFY` 行是通知（派活、任务结果、权限变更等）。
 - 不要写 `sleep` 轮询循环，也不要用 `codex queue` 一类的推送去「提醒」别的会话；只写信，等对方自己的监视。
 - 想在自己派出的 Workflow 子代理开始或结束时也被叫醒：加
   `--journal "C:/Users/<用户>/.claude/projects/<项目>/<会话ID>/subagents/workflows/*/journal.jsonl"`。
