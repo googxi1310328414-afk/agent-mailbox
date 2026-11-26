@@ -1,13 +1,20 @@
 name: release
 
-# 推 v<版本号> 标签时：核对标签与 VERSION 一致、打包、用解出来的包复验，再建 Release 并上传压缩包与 .sha256。
-# 说明取自 CHANGELOG.md 里「## <版本号>」那一节。
+# 发版：核对版本号、打包、用解出来的包复验，再建 Release 并上传压缩包与 .sha256。说明取自 CHANGELOG.md 里「## <版本号>」那一节。
+# 两种触发方式：
+# - 推 v<版本号> 标签：标签须与 scripts/mailbox.py 的 VERSION 一致；
+# - 在 Actions 页面手动运行（只限默认分支）：按 VERSION 在当前提交上创建 v<版本号> 标签；这一版的标签已存在就停，免得重复发。
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 permissions:
   contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -17,15 +24,30 @@ jobs:
       - uses: actions/setup-python@v7
         with:
           python-version: "3.13"
-      - name: 标签与版本号一致
+      - name: 核对版本号与标签
         shell: bash
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           ver=$(python -I -B -c "import sys; sys.path.insert(0, 'tools'); import package; print(package.version())")
-          if [ "v$ver" != "$GITHUB_REF_NAME" ]; then
-            echo "标签 $GITHUB_REF_NAME 与 scripts/mailbox.py 的 VERSION $ver 不一致"
-            exit 1
+          tag="v$ver"
+          if [ "$GITHUB_REF_TYPE" = "tag" ]; then
+            if [ "$GITHUB_REF_NAME" != "$tag" ]; then
+              echo "标签 $GITHUB_REF_NAME 与 scripts/mailbox.py 的 VERSION $ver 不一致"
+              exit 1
+            fi
+          else
+            if [ "$GITHUB_REF_NAME" != "$DEFAULT_BRANCH" ]; then
+              echo "手动发版只能在默认分支 $DEFAULT_BRANCH 上运行，现在是 $GITHUB_REF_NAME"
+              exit 1
+            fi
+            if git ls-remote --exit-code --tags origin "refs/tags/$tag" > /dev/null; then
+              echo "标签 $tag 已存在：这一版已经发过。要发新版请先改 VERSION 并在 CHANGELOG.md 写好说明"
+              exit 1
+            fi
           fi
           echo "VER=$ver" >> "$GITHUB_ENV"
+          echo "TAG=$tag" >> "$GITHUB_ENV"
       - name: 文本自检（损坏字、CR、BOM、不可见字符）
         run: python -I -B tools/check_text.py agent-mailbox tests tools CHANGELOG.md README.md
       - name: 打包
@@ -39,5 +61,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" "dist/agent-mailbox-$VER.zip" "dist/agent-mailbox-$VER.zip.sha256" \
-            --title "agent-mailbox $VER" --notes-file release-notes.md --verify-tag
+          # 推标签触发时标签已在；手动运行时 gh 在当前提交上创建标签
+          gh release create "$TAG" "dist/agent-mailbox-$VER.zip" "dist/agent-mailbox-$VER.zip.sha256" \
+            --title "agent-mailbox $VER" --notes-file release-notes.md --target "$GITHUB_SHA"

@@ -115,9 +115,11 @@ GitHub Actions 会在 Linux、Windows、macOS 上跑以上测试。
 发版：
 1. 改 `scripts/mailbox.py` 里的 `VERSION`；
 2. 在 [`CHANGELOG.md`](CHANGELOG.md) 写好这一版的说明；
-3. 合并后推 `v<版本号>` 标签。
+3. 合并后任选一种方式触发：
+   - 推 `v<版本号>` 标签；
+   - 在 GitHub 的 Actions 页面对 `release` 工作流点 Run workflow（只限默认分支），工作流会按 `VERSION` 自己打标签。
 
-发版工作流（`.github/workflows/release.yml`）会核对版本号、打包、用解出来的包复验，再建 Release 并上传压缩包与 `.sha256`。
+发版工作流（`.github/workflows/release.yml`）会核对版本号、打包、用解出来的包复验，再建 Release 并上传压缩包与 `.sha256`；这一版的标签已存在时，手动运行会停下，不会重复发。
 
 ## 许可
 
