@@ -1,0 +1,43 @@
+name: release
+
+# 推 v<版本号> 标签时：核对标签与 VERSION 一致、打包、用解出来的包复验，再建 Release 并上传压缩包与 .sha256。
+# 说明取自 CHANGELOG.md 里「## <版本号>」那一节。
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: 标签与版本号一致
+        shell: bash
+        run: |
+          ver=$(python -I -B -c "import sys; sys.path.insert(0, 'tools'); import package; print(package.version())")
+          if [ "v$ver" != "$GITHUB_REF_NAME" ]; then
+            echo "标签 $GITHUB_REF_NAME 与 scripts/mailbox.py 的 VERSION $ver 不一致"
+            exit 1
+          fi
+          echo "VER=$ver" >> "$GITHUB_ENV"
+      - name: 文本自检（损坏字、CR、BOM、不可见字符）
+        run: python -I -B tools/check_text.py agent-mailbox tests tools CHANGELOG.md README.md
+      - name: 打包
+        run: python -I -B tools/package.py
+      - name: 复验（解包后跑自检、单元与 MCP 测试）
+        run: python -I -B tools/verify_package.py "dist/agent-mailbox-$VER.zip" --skip-pi
+      - name: 发布说明
+        run: python -I -B tools/release_notes.py "$VER" "dist/agent-mailbox-$VER.zip.sha256" > release-notes.md
+      - name: 建 Release 并上传压缩包
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" "dist/agent-mailbox-$VER.zip" "dist/agent-mailbox-$VER.zip.sha256" \
+            --title "agent-mailbox $VER" --notes-file release-notes.md --verify-tag
