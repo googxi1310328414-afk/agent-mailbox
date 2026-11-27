@@ -434,6 +434,21 @@ class WatchTest(unittest.TestCase):
         self.assertIn('"exit": 0', o)
         self.assertEqual(b.jrun("tasks", "--as", "helper-c")["waits"], [])
 
+    def test_skips_letters_already_delivered_over_mcp(self):
+        # MCP 已随工具结果把信交给模型（游标里的 delivered），监视不再重复报（也就不再推送一次）
+        b = self.b
+        self.assertEqual(b.run("send", "--as", "boss", "--to", "helper-c", "--subject", "已送达的信", "--body", "x")[0], 0)
+        name = [x for x in b.files() if x.startswith("to-helper-c-")][0]
+        b.mailbox().update_cursor("helper-c", lambda d: d.update(delivered=[name]))
+        c, o, e = self.watch(seconds=2)
+        self.assertEqual(c, 3, o + e)
+        self.assertNotIn("已送达的信", o)
+        b.run("send", "--as", "boss", "--to", "helper-c", "--subject", "没送达的信", "--body", "x")
+        c, o, e = self.watch(seconds=5)
+        self.assertEqual(c, 0, o + e)
+        self.assertIn("没送达的信", o)
+        self.assertNotIn("已送达的信", o)
+
     def test_waitfile_waits_until_written(self):
         b = self.b
         res = os.path.join(b.dir, "RESULT2.json")

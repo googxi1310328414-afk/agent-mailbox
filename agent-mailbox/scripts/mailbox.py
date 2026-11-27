@@ -3724,6 +3724,7 @@ class Watcher(object):
             return
         self.cursor_mtime = mt
         self.read_set = set(d.get("read") or [])
+        self.delivered_set = set(d.get("delivered") or [])  # MCP 已随工具结果交给模型的信
         self.notified = set(d.get("notified") or []) | self.new_notified
         self.notify_mark = max(self.notify_mark, int(d.get("notify_seen") or 0))
         for k, v in (d.get("talk_seen") or {}).items():
@@ -3777,11 +3778,11 @@ class Watcher(object):
     def poll_mail(self, letters):
         now = time.time()
         self.sync_cursor()
-        read = getattr(self, "read_set", set())
+        read = getattr(self, "read_set", set()) | getattr(self, "delivered_set", set())
         for l in letters:
             if l.box not in self.boxes or l.name in self.notified:
                 continue
-            if l.name in read:  # 监视还没扫到就已经读过了：只记为提醒过，不再报
+            if l.name in read:  # 监视还没扫到就已经读过（或已随 MCP 工具结果送达）：只记为提醒过，不再报
                 self.notified.add(l.name)
                 self.new_notified.add(l.name)
                 continue

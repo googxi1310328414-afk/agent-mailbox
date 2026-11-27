@@ -222,14 +222,17 @@ class McpTest(McpBase):
         self.assertGreaterEqual(r["structuredContent"]["count"], 1)
         prog = [m for m in a.notes("notifications/progress") if m["params"]["progressToken"] == "w1"]
         self.assertGreaterEqual(len(prog), 1)
-        ch = a.notes("notifications/claude/channel")
-        self.assertTrue(ch and "紧急：停测" in ch[-1]["params"]["content"])
-        self.assertEqual(ch[-1]["params"]["meta"]["urgent"], "1")
-        self.assertTrue(all(k.replace("_", "").isalnum() for k in ch[-1]["params"]["meta"]))
-        up = [m for m in a.notes("notifications/resources/updated") if m["params"]["uri"] == "mailbox://inbox"]
-        self.assertTrue(up)
         r = a.call("mailbox_wait", {"timeout_seconds": 2}, timeout=30)
         self.assertTrue(r["structuredContent"].get("timeout"))
+        # 没在等的时候来的信由后台监视推送：频道注入、订阅了的资源更新。
+        # （正在 mailbox_wait 时信随等待结果交出，监视不再重复推送同一封）
+        boss.call("mailbox_send", {"to": "helper-a", "subject": "紧急：再停", "body": "立即停。", "urgent": True})
+        ch = a.wait_for(lambda m: m.get("method") == "notifications/claude/channel" and "紧急：再停" in m["params"]["content"], 20)
+        self.assertIsNotNone(ch)
+        self.assertEqual(ch["params"]["meta"]["urgent"], "1")
+        self.assertTrue(all(k.replace("_", "").isalnum() for k in ch["params"]["meta"]))
+        self.assertIsNotNone(a.wait_for(lambda m: m.get("method") == "notifications/resources/updated"
+                                        and m["params"]["uri"] == "mailbox://inbox", 20))
 
     def test_banner_on_other_tools(self):
         boss, a = self.client("boss"), self.client("helper-a")
