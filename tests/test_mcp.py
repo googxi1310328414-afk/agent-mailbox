@@ -226,12 +226,14 @@ class McpTest(McpBase):
         self.assertTrue(r["structuredContent"].get("timeout"))
         # 没在等的时候来的信由后台监视推送：频道注入、订阅了的资源更新。
         # （正在 mailbox_wait 时信随等待结果交出，监视不再重复推送同一封）
+        old = set(id(m) for m in a.msgs)  # 只看这之后收到的推送
         boss.call("mailbox_send", {"to": "helper-a", "subject": "紧急：再停", "body": "立即停。", "urgent": True})
-        ch = a.wait_for(lambda m: m.get("method") == "notifications/claude/channel" and "紧急：再停" in m["params"]["content"], 20)
+        ch = a.wait_for(lambda m: id(m) not in old and m.get("method") == "notifications/claude/channel"
+                        and "紧急：再停" in m["params"]["content"], 20)
         self.assertIsNotNone(ch)
         self.assertEqual(ch["params"]["meta"]["urgent"], "1")
         self.assertTrue(all(k.replace("_", "").isalnum() for k in ch["params"]["meta"]))
-        self.assertIsNotNone(a.wait_for(lambda m: m.get("method") == "notifications/resources/updated"
+        self.assertIsNotNone(a.wait_for(lambda m: id(m) not in old and m.get("method") == "notifications/resources/updated"
                                         and m["params"]["uri"] == "mailbox://inbox", 20))
 
     def test_banner_on_other_tools(self):
@@ -544,11 +546,13 @@ class McpCollabTest(McpBase):
         self.assertEqual(r["structuredContent"]["total"], 2)
         # 被叫方没在等的时候，新消息由后台监视推送：频道注入、订阅了的资源更新。
         # （正在 mailbox_wait 时消息随等待结果交出，监视不再重复推送同一条）
+        old = set(id(m) for m in a.msgs)  # 只看这之后收到的推送
         boss.call("mailbox_talk", {"action": "say", "conv": "c1", "text": "再补一句"})
-        ch = a.wait_for(lambda m: m.get("method") == "notifications/claude/channel" and "TALK" in m["params"]["meta"]["kinds"], 15)
+        ch = a.wait_for(lambda m: id(m) not in old and m.get("method") == "notifications/claude/channel"
+                        and "再补一句" in m["params"]["content"], 15)
         self.assertIsNotNone(ch)
-        self.assertIn("再补一句", ch["params"]["content"])
-        self.assertIsNotNone(a.wait_for(lambda m: m.get("method") == "notifications/resources/updated"
+        self.assertIn("TALK", ch["params"]["meta"]["kinds"])
+        self.assertIsNotNone(a.wait_for(lambda m: id(m) not in old and m.get("method") == "notifications/resources/updated"
                                         and m["params"]["uri"] == "mailbox://talk", 15))
 
     def test_call_timeout_then_late_reply_and_next(self):
