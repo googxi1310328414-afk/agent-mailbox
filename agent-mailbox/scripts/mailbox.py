@@ -30,7 +30,7 @@ import tempfile
 import threading
 import time
 
-VERSION = "1.2.1"
+VERSION = "1.3.0"
 SCHEMA = "agent-mailbox/1"
 CONTROL = ".agent-mailbox"
 SKILL_NAME = "agent-mailbox"
@@ -516,7 +516,8 @@ def default_config(thread=""):
         "max_bytes": 65536,
         "max_tries": 50,
         "pad": 3,
-        "policy": {"assistant_to_assistant": "allow", "broadcast": "controller", "inactive_send": "deny"},
+        "policy": {"assistant_to_assistant": "allow", "broadcast": "controller", "inactive_send": "deny",
+                   "talk_max_turns": TALK_TURNS_DEFAULT, "talk_burst": TALK_BURST_DEFAULT},
         "secret_patterns": [],
         "participants": [],
     }
@@ -573,6 +574,28 @@ def validate_config(cfg):
         errors.append("policy.broadcast 只能是 controller / anyone")
     if pol.get("inactive_send") not in ("deny", "allow"):
         errors.append("policy.inactive_send 只能是 deny / allow")
+    tm = pol.get("talk_max_turns")
+    if not isinstance(tm, int) or isinstance(tm, bool) or not 0 <= tm <= 100000:
+        errors.append("policy.talk_max_turns 须是 0–100000 的整数（0 表示不限）：%r" % (tm,))
+    if pol.get("talk_burst") != "off" and parse_burst(pol.get("talk_burst")) is None:
+        errors.append("policy.talk_burst 只能是 off，或「条数/秒数」如 20/300（条数 2–10000，秒数 10–86400）：%r"
+                      % (pol.get("talk_burst"),))
+    quotas = cfg.get("quotas")
+    if quotas is not None:
+        if not isinstance(quotas, dict):
+            errors.append("quotas 须是对象：{\"kimi-1\": {\"talk\": \"60/h\"}, \"@assistants\": {...}}")
+        else:
+            for subj, v in quotas.items():
+                if subj not in QUOTA_GROUPS and not NAME_RE.match(str(subj)):
+                    errors.append("quotas 的对象只能是参与方名或 %s：%r" % (" / ".join(QUOTA_GROUPS), subj))
+                elif not isinstance(v, dict):
+                    errors.append("quotas.%s 须是对象，如 {\"talk\": \"60/h\"}" % subj)
+                else:
+                    for act, lim in v.items():
+                        if act not in QUOTA_ACTIONS:
+                            warns.append("quotas.%s 里有看不懂的配额项 %r，已忽略" % (subj, act))
+                        elif lim != "none" and parse_quota(lim) is None:
+                            errors.append("quotas.%s.%s 只能写「次数/m|h|d」（如 60/h）或 none：%r" % (subj, act, lim))
     for pat in cfg.get("secret_patterns") or []:
         try:
             re.compile(pat)
@@ -763,6 +786,136 @@ def perm_match(entry, key, target):
             return 2
         return 0
     return 3 if scope == str(target) else 0
+
+
+def perm_may(mb, p, key):
+    """p 能否对至少一个对象用 key：决定 MCP 工具清单里列不列相应的工具和动作。
+    这只是清单上的取舍，真正的判定仍由 perm_decide 按具体对象来做。"""
+    if p is USER or (p["role"] == "controller" and p["active"]):
+        return True
+    if not p["active"]:
+        return key == "send" and mb.cfg["policy"].get("inactive_send") == "allow"
+
+    def mine(xs):
+        out = []
+        for e in xs or []:
+            pe = parse_perm(e)
+            if pe is not None and pe[0] in (key, "*"):
+                out.append(pe[1])
+        return out
+    allow, deny, preset = mine(p.get("allow")), mine(p.get("deny")), mine(role_preset(mb.cfg, p["role"]))
+    if None in deny:  # 不限范围的收回压过预设与不限范围的授予，只剩更具体的授予还能用
+        return any(s is not None for s in allow)
+    return bool(allow or preset)
+
+
+# ------------------------------------------------------------------ 配额
+# 主控可以按人（或按角色组 @assistants、@observers）限制一段时间内的用量，防止模型之间失控地来回、反复开新通话。
+# 写法「次数/窗口」：60/h 表示任意连续一小时内最多 60 次；none 表示明确不限（压过角色组的配额）。主控与用户不受配额限制。
+QUOTA_ACTIONS = ("talk", "call", "send", "notify", "queue.push")
+QUOTA_ZH = {"talk": "通话发言", "call": "新开通话", "send": "发信", "notify": "发通知", "queue.push": "投任务"}
+QUOTA_GROUPS = ("@assistants", "@observers")
+QUOTA_RE = re.compile(r"^([1-9][0-9]{0,5})/([mhd])$")
+QUOTA_UNIT = {"m": 60, "h": 3600, "d": 86400}
+QUOTA_UNIT_ZH = {"m": "分钟", "h": "小时", "d": "天"}
+BURST_RE = re.compile(r"^([0-9]{1,5})/([0-9]{1,5})$")
+TALK_TURNS_DEFAULT = 40
+TALK_BURST_DEFAULT = "20/300"
+
+
+def parse_quota(s):
+    """「60/h」→（60，3600，"h"）；看不懂返回 None。"""
+    m = QUOTA_RE.match(str(s or "").strip())
+    return (int(m.group(1)), QUOTA_UNIT[m.group(2)], m.group(2)) if m else None
+
+
+def quota_zh(spec):
+    q = parse_quota(spec)
+    return "%d 次/%s" % (q[0], QUOTA_UNIT_ZH[q[2]]) if q else ("不限" if spec == "none" else str(spec))
+
+
+def parse_burst(s):
+    """「20/300」→（20，300）：300 秒内来回 20 条就暂停；看不懂或越界返回 None。"""
+    m = BURST_RE.match(str(s or "").strip())
+    if not m:
+        return None
+    n, secs = int(m.group(1)), int(m.group(2))
+    return (n, secs) if 2 <= n <= 10000 and 10 <= secs <= 86400 else None
+
+
+def quota_for(cfg, p, action):
+    """p 在 action 上的配额：（次数，窗口秒数，单位，原写法）；不限返回 None。点名的配额优先于角色组的。"""
+    if p is USER or (p["role"] == "controller" and p["active"]):
+        return None
+    qs = cfg.get("quotas") or {}
+    group = {"assistant": "@assistants", "observer": "@observers"}.get(p["role"])
+    for subj in (p["name"], group):
+        v = (qs.get(subj) or {}).get(action) if subj else None
+        if v is None:
+            continue
+        q = parse_quota(v)
+        return q + (v,) if q else None  # none（或坏值）都按不限
+    return None
+
+
+def usage_path(mb, name):
+    return mb.p("usage", name + ".json")
+
+
+def quota_used(mb, p, action, q=None):
+    """当前窗口里已用的次数。"""
+    q = q or quota_for(mb.cfg, p, action)
+    if not q:
+        return 0
+    d = load_json_quiet(usage_path(mb, p["name"])) or {}
+    xs = d.get(action) if isinstance(d, dict) else None
+    now = time.time()
+    return len([t for t in xs or [] if isinstance(t, (int, float)) and now - t < q[1]])
+
+
+def span_zh(seconds):
+    s = max(1, int(seconds))
+    if s < 60:
+        return "%d 秒" % s
+    if s < 3600:
+        return "%d 分钟" % ((s + 59) // 60)
+    return "%.1f 小时" % (s / 3600.0)
+
+
+def quota_take(mb, p, action):
+    """用掉一次 action 的配额。用完了就报错拒绝，并在每个窗口里最多通知主控一次。"""
+    q = quota_for(mb.cfg, p, action)
+    if q is None:
+        return
+    n, secs, unit, spec = q
+    path = usage_path(mb, p["name"])
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with FileLock(mb.p("locks", "usage-%s.lock" % p["name"])):
+        d = load_json_quiet(path)
+        d = d if isinstance(d, dict) else {}
+        now = time.time()
+        xs = [float(t) for t in d.get(action) or [] if isinstance(t, (int, float)) and now - t < secs]
+        if len(xs) < n:
+            d[action] = xs[-(n - 1):] + [now] if n > 1 else [now]
+            atomic_write(path, dump_json(d))
+            return
+        warned = d.get("warned") if isinstance(d.get("warned"), dict) else {}
+        tell = now - float(warned.get(action) or 0) >= secs
+        if tell:
+            warned[action] = now
+            d["warned"], d[action] = warned, xs
+            atomic_write(path, dump_json(d))
+        back = min(xs) + secs - now
+    if tell:
+        try:
+            boss = [mb.controller()["name"]]
+        except CliError:
+            boss = []
+        notify_system(mb, boss, "quota", "%s 的%s配额（%s）用完了；约 %s 后自动恢复。要放宽用 perm quota %s %s <次数/窗口>"
+                      "（MCP：mailbox_perm quota）。" % (p["name"], QUOTA_ZH[action], quota_zh(spec), span_zh(back), p["name"], action),
+                      p["name"], "配额用完")
+    raise CliError("配额用完：%s 的%s上限是 %s，约 %s 后恢复；不要换身份或换工具绕开，确有需要请向主控申请（perm quota）"
+                   % (p["name"], QUOTA_ZH[action], quota_zh(spec), span_zh(back)), 2)
 
 
 class Router(object):
@@ -1590,6 +1743,63 @@ def append_bytes(path, data):
         os.close(fd)
 
 
+# ------------------------------------------------------------------ 门铃
+# 发言、发通知、投信之后，写入方给每个收件方的门铃文件（控制目录下 bell/<名字>）追加一个字节。
+# 等待方每 BELL_TICK 秒看一眼本方门铃的 inode、大小与修改时间，变了才去做完整检查。
+# 门铃只是提示，收件一律以状态为准：漏响（比如旧版本写入方）只是退回原来的轮询间隔，多响只是多查一次。
+BELL_TICK = 0.1
+BELL_MAX = 65536
+
+
+def bell_path(mb, name):
+    return mb.p("bell", name)
+
+
+def ring(mb, names):
+    """按门铃叫醒这些参与方正在等待的进程。尽力而为：写不进去不影响主操作。"""
+    if mb.read_only:
+        return
+    for n in dict.fromkeys(x for x in names if x):
+        path = bell_path(mb, n)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND | getattr(os, "O_BINARY", 0), 0o644)
+            try:
+                if os.fstat(fd).st_size >= BELL_MAX:
+                    os.ftruncate(fd, 0)  # 截短同样改变大小与修改时间，等待方照样能察觉
+                os.write(fd, b".")
+            finally:
+                os.close(fd)
+        except OSError:
+            pass
+
+
+def bell_key(mb, name):
+    try:
+        st = os.stat(bell_path(mb, name))
+    except OSError:
+        return None
+    return (st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def bell_wait(mb, name, seconds, key, stop=None):
+    """最多等 seconds 秒；本方门铃与 key 不同了就提前返回 True。stop（threading.Event）置位时返回 False。
+    key 要在做完整检查之前取：检查之后才响的门铃也能被察觉，不会漏掉。"""
+    end = time.time() + max(0.0, seconds)
+    while True:
+        left = end - time.time()
+        if left <= 0:
+            return False
+        step = min(BELL_TICK, left)
+        if stop is not None:
+            if stop.wait(step):
+                return False
+        else:
+            time.sleep(step)
+        if bell_key(mb, name) != key:
+            return True
+
+
 _FILE_CACHE = {}
 _FILE_CACHE_LOCK = threading.Lock()
 
@@ -1751,7 +1961,9 @@ def notify_push(mb, name, kind, text, frm="", title="", urgent=False, ref=None):
         if ref:
             rec["ref"] = ref
         return rec
-    return jsonl_append(mb, "notify-%s.lock" % name, feed_path(mb, name), make, after=lambda: rotate_feed(mb, name))
+    rec = jsonl_append(mb, "notify-%s.lock" % name, feed_path(mb, name), make, after=lambda: rotate_feed(mb, name))
+    ring(mb, [name])
+    return rec
 
 
 def notify_system(mb, names, kind, text, frm="", title="", urgent=False, ref=None):
@@ -1798,17 +2010,23 @@ def iso_at(epoch):
     return iso_utc(dt.datetime.fromtimestamp(epoch, UTC))
 
 
-def poll_until(seconds, fn, interval=0.5):
-    """每隔 interval 秒调一次 fn，直到它返回真值或超时（返回 None）。"""
+def poll_until(seconds, fn, interval=0.5, bell=None):
+    """每隔 interval 秒调一次 fn，直到它返回真值或超时（返回 None）。
+    bell=（信箱，参与方名）时，那人的门铃一响就提前再调一次。"""
     deadline = time.time() + max(0.0, float(seconds or 0))
     while True:
+        key = bell_key(*bell) if bell else None
         r = fn()
         if r:
             return r
         left = deadline - time.time()
         if left <= 0:
             return None
-        time.sleep(min(interval, max(0.05, left)))
+        step = min(interval, max(0.05, left))
+        if bell:
+            bell_wait(bell[0], bell[1], step, key)
+        else:
+            time.sleep(step)
 
 
 def resolve_people(mb, me, spec, what):
@@ -1921,7 +2139,16 @@ def talk_brief(meta):
     return {"id": meta["id"], "topic": meta.get("topic") or "", "state": meta.get("state") or "open",
             "created_by": meta.get("created_by") or "", "created_at": meta.get("created_at") or "",
             "members": [m["name"] for m in meta.get("members") or [] if not m.get("left")],
-            "left": [m["name"] for m in meta.get("members") or [] if m.get("left")]}
+            "left": [m["name"] for m in meta.get("members") or [] if m.get("left")],
+            "paused": meta.get("paused") or None, "limits": meta.get("limits") or {}}
+
+
+def talk_state_zh(b):
+    if b.get("state") != "open":
+        return "已结束"
+    if b.get("paused"):
+        return "已暂停（%s）" % (b["paused"].get("reason") or "主控暂停")
+    return "进行中"
 
 
 def talk_mine(mb, name, closed=True):
@@ -1960,18 +2187,54 @@ def talk_queue(mb, name, seen=None):
     return rows
 
 
-def talk_create(mb, me, people, topic):
+def is_boss(p):
+    return p is USER or (p["role"] == "controller" and p["active"])
+
+
+def talk_member_names(meta, but=None):
+    return [m["name"] for m in meta.get("members") or [] if not m.get("left") and m.get("name") != but]
+
+
+def talk_ring(mb, meta, but=None):
+    ring(mb, talk_member_names(meta, but))
+
+
+def talk_paused_error(mb, meta):
+    pz = meta.get("paused") or {}
+    try:
+        boss = mb.controller()["name"]
+    except CliError:
+        boss = "主控"
+    return CliError("通话 %s 已暂停（%s）：等主控 %s 用 talk resume %s 让它继续（MCP：mailbox_talk resume）；"
+                    "不要另开通话或换工具绕过" % (meta["id"], pz.get("reason") or "主控暂停", boss, meta["id"]), 2)
+
+
+def talk_create(mb, me, people, topic, charge=None):
+    """建通话。charge() 在确认没有绕开暂停之后、真正建之前调用（用来扣「新开通话」的配额）。"""
     mb.require_writable()
     os.makedirs(mb.p("talk"), exist_ok=True)
     now = iso_utc()
-    members = [{"name": x, "since": 0, "at": now} for x in dict.fromkeys([me["name"]] + [p["name"] for p in people])]
+    names = list(dict.fromkeys([me["name"]] + [p["name"] for p in people]))
+    members = [{"name": x, "since": 0, "at": now} for x in names]
+    if not is_boss(me):
+        for cid in talk_ids(mb):  # 同一批人的通话被暂停时，不许另开一个绕过去
+            try:
+                old = talk_meta(mb, cid)
+            except CliError:
+                continue
+            if old and old.get("state") == "open" and old.get("paused") and set(talk_member_names(old)) == set(names):
+                raise talk_paused_error(mb, old)
+    if charge is not None:
+        charge()
+    pol = mb.cfg["policy"]
+    limits = {"max_turns": int(pol.get("talk_max_turns") or 0), "burst": pol.get("talk_burst") or "off"}
     with FileLock(mb.p("locks", "talk.lock")):
         ids = talk_ids(mb)
         n = int(ids[-1][1:]) + 1 if ids else 1
         for _ in range(50):
             cid = "c%d" % n
             meta = {"schema": TALK_SCHEMA, "id": cid, "topic": clip(topic, 200), "created_by": me["name"],
-                    "created_at": now, "state": "open", "members": members}
+                    "created_at": now, "state": "open", "members": members, "limits": limits}
             try:
                 with open(talk_meta_path(mb, cid), "xb") as f:
                     f.write(dump_json(meta))
@@ -1984,24 +2247,56 @@ def talk_create(mb, me, people, topic):
 
 def _talk_record(me, kind, text, **extra):
     def make(seq):
-        rec = {"seq": seq, "at": iso_utc(), "from": me["name"], "kind": kind, "text": text}
+        rec = {"seq": seq, "at": iso_utc(), "from": me["name"] if me else "", "kind": kind, "text": text}
         rec.update((k, v) for k, v in extra.items() if v)
         return rec
     return make
 
 
+def talk_turns(log):
+    """计入上限的发言：用户（人）说的不算。"""
+    return [x for x in log if x.get("kind", "msg") == "msg" and x.get("from") != "user"]
+
+
+def talk_limit_hit(meta, log, now):
+    """刚发完一条之后，看要不要自动暂停：到了条数上限，或两方在短时间内快速来回。返回原因或 None。"""
+    lim = meta.get("limits") or {}  # 1.3 之前建的通话没有 limits，不受限
+    turns = talk_turns(log)
+    cap = int(lim.get("max_turns") or 0)
+    if cap and len(turns) >= cap:
+        return "已到 %d 条发言上限" % cap
+    burst = parse_burst(lim.get("burst"))
+    if burst:
+        n, secs = burst
+        after = int(meta.get("resumed_seq") or 0)  # 主控让它继续之前的不算（按序号划界，时间戳只精确到秒）
+
+        def fresh(x):
+            return x["seq"] > after and (ts_of(x.get("at")) or 0) >= now - secs
+        recent = [x for x in turns if fresh(x)]
+        human = any(x.get("from") == "user" and fresh(x) for x in log)
+        who = sorted(set(x.get("from") or "?" for x in recent))
+        if len(recent) >= n and len(who) <= 2 and not human:
+            return "%s 在 %d 秒内来回了 %d 条，像是停不下来的循环" % ("、".join(who), secs, len(recent))
+    return None
+
+
 def talk_post(mb, me, cid, text, reply_to=0, urgent=False):
-    """在通话里发言：须是成员（主控、用户会自动加入）；对其中每个在任成员都要有 talk 权限。"""
+    """在通话里发言：须是成员（主控、用户会自动加入）；对其中每个在任成员都要有 talk 权限。
+    通话暂停时只有主控和用户能发言；这一条若让通话到了上限或像是停不下来的循环，就自动暂停并通知主控。"""
     mb.require_writable()
+    boss = is_boss(me)
+    paused = None
     with FileLock(mb.p("locks", "talk-%s.lock" % cid)):
         meta = talk_meta(mb, cid, fresh=True)
         if meta is None:
             raise CliError("没有通话 %s（talk list 查看）" % cid, 2)
         if meta.get("state") != "open":
             raise CliError("通话 %s 已结束（%s 于 %s）；要继续请另起一个" % (cid, meta.get("closed_by"), meta.get("closed_at")), 2)
+        if meta.get("paused") and not boss:
+            raise talk_paused_error(mb, meta)
         log = talk_log_path(mb, cid)
         if not talk_in(meta, me["name"]):
-            if not (me is USER or (me["role"] == "controller" and me["active"])):
+            if not boss:
                 raise CliError("你不在通话 %s 里；请成员用 talk invite 邀请你" % cid, 2)
             _talk_join(meta, [me["name"]], jsonl_tail_seq(log)[0])
             atomic_write(talk_meta_path(mb, cid), dump_json(meta))
@@ -2011,7 +2306,24 @@ def talk_post(mb, me, cid, text, reply_to=0, urgent=False):
         if reply_to:
             if not any(x["seq"] == reply_to for x in jsonl_read(log)):
                 raise CliError("通话 %s 里没有第 %d 条" % (cid, reply_to), 2)
+        quota_take(mb, me, "talk")
         rec = append_seq(log, _talk_record(me, "msg", text, reply_to=reply_to, urgent=bool(urgent)))
+        if not meta.get("paused"):
+            paused = talk_limit_hit(meta, talk_log(mb, cid), time.time())  # 增量读：只读刚追加的部分
+            if paused:
+                meta["paused"] = {"at": iso_utc(), "by": "", "reason": paused}
+                atomic_write(talk_meta_path(mb, cid), dump_json(meta))
+                append_seq(log, _talk_record(None, "pause", "通话自动暂停：%s。等主控决定继续（talk resume）还是结束" % paused))
+    talk_ring(mb, meta, but=me["name"] if not paused else None)
+    if paused:
+        try:
+            ctrl = mb.controller()["name"]
+        except CliError:
+            ctrl = ""
+        notify_system(mb, [ctrl], "talk-paused", "通话 %s%s（%s）自动暂停：%s。要继续用 talk resume %s（可带 --max-turns 改上限），"
+                      "要停就 talk close %s（MCP：mailbox_talk resume / close）。" % (
+                          cid, ("「%s」" % meta["topic"]) if meta.get("topic") else "", "、".join(talk_member_names(meta)),
+                          paused, cid, cid), me["name"], "通话暂停", ref={"conv": cid})
     return rec, meta
 
 
@@ -2026,19 +2338,49 @@ def _talk_join(meta, names, last_seq):
             m.pop("left_at", None)
 
 
-def talk_change(mb, me, cid, op, people=None, cc=None):
-    """邀请（invite）、退出（leave）、结束（close）。"""
+def talk_change(mb, me, cid, op, people=None, cc=None, reason="", max_turns=None, burst=None):
+    """邀请（invite）、退出（leave）、结束（close）、暂停（pause）、继续（resume，可顺带改上限）。"""
     mb.require_writable()
     with FileLock(mb.p("locks", "talk-%s.lock" % cid)):
         meta = talk_meta(mb, cid, fresh=True)
         if meta is None:
             raise CliError("没有通话 %s" % cid, 2)
-        boss = me is USER or (me["role"] == "controller" and me["active"])
+        boss = is_boss(me)
         if op != "close" and meta.get("state") != "open":
             raise CliError("通话 %s 已结束" % cid, 2)
+        if op in ("pause", "resume") and not boss:
+            raise CliError("只有主控或用户能暂停、继续通话、改通话上限", 2)
+        if op == "invite" and meta.get("paused") and not boss:
+            raise talk_paused_error(mb, meta)
         log = talk_log_path(mb, cid)
         last = jsonl_tail_seq(log)[0]
-        if op == "invite":
+        if op == "pause":
+            if meta.get("paused"):
+                raise CliError("通话 %s 已经暂停了（%s）" % (cid, meta["paused"].get("reason") or ""), 2)
+            why = clip(reason or "主控暂停", 300)
+            meta["paused"] = {"at": iso_utc(), "by": me["name"], "reason": why}
+            rec = dict(kind="pause", text="%s 暂停了通话：%s" % (me["name"], why))
+        elif op == "resume":
+            lim = dict(meta.get("limits") or {})
+            turns = len(talk_turns(jsonl_read(log)))
+            if max_turns is not None:
+                lim["max_turns"] = int(max_turns)
+            elif int(lim.get("max_turns") or 0) and turns >= int(lim["max_turns"]):
+                # 因为到了上限才停的：不说新上限就再给一轮（策略里的条数，至少 10 条）
+                lim["max_turns"] = turns + max(10, int(mb.cfg["policy"].get("talk_max_turns") or TALK_TURNS_DEFAULT))
+            if burst is not None:
+                lim["burst"] = burst
+            if not meta.get("paused") and max_turns is None and burst is None:
+                raise CliError("通话 %s 没有暂停；要改上限请带 --max-turns 或 --burst" % cid, 2)
+            was = meta.pop("paused", None)
+            meta["limits"] = lim
+            meta["resumed_at"], meta["resumed_seq"] = iso_utc(), last
+            cap = int(lim.get("max_turns") or 0)
+            desc = "上限 %s 条（已有 %d 条）" % (cap if cap else "不限", turns)
+            if lim.get("burst") and lim.get("burst") != "off":
+                desc += "，快速来回超过 %s（条/秒）会再暂停" % lim["burst"]
+            rec = dict(kind="resume", text="%s %s：%s" % (me["name"], "让通话继续" if was else "改了通话上限", desc))
+        elif op == "invite":
             if not talk_in(meta, me["name"]) and not boss:
                 raise CliError("你不在通话 %s 里，不能邀请别人" % cid, 2)
             new = [p for p in people if not talk_in(meta, p["name"])]
@@ -2068,6 +2410,8 @@ def talk_change(mb, me, cid, op, people=None, cc=None):
         atomic_write(talk_meta_path(mb, cid), dump_json(meta))
         kind, text = rec.pop("kind"), rec.pop("text")
         out = append_seq(log, _talk_record(me, kind, text, **rec))
+    ring(mb, [m["name"] for m in meta.get("members") or [] if m.get("name") != me["name"]
+              and (not m.get("left") or op == "close")])
     return out, meta
 
 
@@ -2573,11 +2917,16 @@ def cmd_roster_policy(a):
     mb = open_mb(a)
     me = mb.identity(a.me or "")
     mb.require_controller(me)
-    changes = dict((k, getattr(a, k)) for k in ("assistant_to_assistant", "broadcast", "inactive_send")
-                   if getattr(a, k) is not None)
+    changes = dict((k, getattr(a, k)) for k in ("assistant_to_assistant", "broadcast", "inactive_send",
+                                                "talk_max_turns", "talk_burst")
+                   if getattr(a, k, None) is not None)
     if not changes:
         emit_json(mb.cfg["policy"])
         return 0
+    if "talk_max_turns" in changes and not 0 <= changes["talk_max_turns"] <= 100000:
+        raise CliError("--talk-max-turns 须在 0–100000 之间（0 表示不限）", 2)
+    if "talk_burst" in changes and changes["talk_burst"] != "off" and parse_burst(changes["talk_burst"]) is None:
+        raise CliError("--talk-burst 只能是 off，或「条数/秒数」如 20/300（条数 2–10000，秒数 10–86400）", 2)
 
     def fn(cfg):
         cfg["policy"].update(changes)
@@ -2653,10 +3002,21 @@ def cmd_roster_handover(a):
 SCOPE_ZH = {"who": "参与方或角色组", "queue": "队列", "": "不分范围"}
 
 
+def quota_rows(mb, p):
+    """p 当前生效的配额与本窗口已用次数：{动作: {"limit": "60/h", "used": 12}}。"""
+    out = {}
+    for act in QUOTA_ACTIONS:
+        q = quota_for(mb.cfg, p, act)
+        if q:
+            out[act] = {"limit": q[3], "used": quota_used(mb, p, act, q)}
+    return out
+
+
 def perm_row(mb, p):
     preset, allow, deny = mb.perm_summary(p)
     return {"name": p["name"], "role": p["role"], "active": p["active"], "preset": preset, "allow": allow,
-            "deny": deny, "token": bool(mb.cfg.get("user_token_sha256") if p is USER else p.get("token_sha256"))}
+            "deny": deny, "token": bool(mb.cfg.get("user_token_sha256") if p is USER else p.get("token_sha256")),
+            "quota": quota_rows(mb, p)}
 
 
 def emit_perm_row(r):
@@ -2667,6 +3027,9 @@ def emit_perm_row(r):
         emit("  授予：%s" % "、".join(r["allow"]))
     if r["deny"]:
         emit("  收回：%s" % "、".join(r["deny"]))
+    if r.get("quota"):
+        emit("  配额：%s" % "；".join("%s %s（已用 %d）" % (QUOTA_ZH[k], quota_zh(v["limit"]), v["used"])
+                                    for k, v in r["quota"].items()))
 
 
 def parse_perm_args(mb, items):
@@ -2838,6 +3201,89 @@ def cmd_perm_preset(a):
         emit_json({"role": role, "preset": after, "custom": new is not None})
     else:
         emit("%s预设已%s：%s" % (ROLE_ZH[role], "恢复为由通信策略推出" if new is None else "改为", "、".join(after) or "（无）"))
+    return 0
+
+
+def cmd_perm_quota(a):
+    mb = open_mb(a)
+    cfg = mb.cfg
+    subj = a.subject
+    if subj and subj not in QUOTA_GROUPS:
+        subj = mb.lookup(subj)["name"]
+    if a.limit is None:
+        if a.act is not None and subj is None:
+            raise CliError("要先给对象：perm quota <参与方或 @assistants> %s <次数/窗口>" % a.act, 2)
+        raw = cfg.get("quotas") or {}
+        if subj in QUOTA_GROUPS:
+            ps = [p for p in mb.participants(True) if p["role"] == ROLE_SCOPES[subj]]
+        elif subj:
+            ps = [mb.get(subj)]
+        else:
+            ps = mb.participants(True)
+        rows = [{"name": p["name"], "role": p["role"], "quota": quota_rows(mb, p)} for p in ps]
+        if a.json:
+            emit_json({"quotas": raw, "participants": rows})
+            return 0
+        if not raw:
+            emit("还没有配额：任何人都不限次数（主控用 perm quota <对象> <动作> <次数/窗口> 设，如 perm quota @assistants call 20/h）")
+            return 0
+        emit("配额设置（点名的优先于角色组；主控与用户不受限）：")
+        for k in sorted(raw):
+            emit("  %s：%s" % (k, "；".join("%s %s" % (QUOTA_ZH.get(x, x), quota_zh(v)) for x, v in sorted(raw[k].items()))))
+        for r in rows:
+            if r["quota"]:
+                emit("  %s 本窗口已用：%s" % (r["name"], "；".join("%s %d/%s" % (QUOTA_ZH[k], v["used"], quota_zh(v["limit"]))
+                                                            for k, v in r["quota"].items())))
+        return 0
+    me = mb.identity(a.me or "")
+    mb.require_controller(me)
+    if not subj or not a.act:
+        raise CliError("写法：perm quota <参与方或 @assistants、@observers> <动作> <次数/窗口|none|off>", 2)
+    if subj not in QUOTA_GROUPS:
+        t = mb.get(subj)
+        if t["role"] == "controller" and t["active"]:
+            raise CliError("主控不受配额限制，不用给主控设配额", 2)
+    lim = a.limit.strip().lower()
+    if lim not in ("off", "none") and parse_quota(lim) is None:
+        raise CliError("配额写作「次数/窗口」，窗口是 m（分钟）、h（小时）或 d（天），如 60/h；none 明确不限，off 去掉这一条", 2)
+
+    def fn(c):
+        qs = dict(c.get("quotas") or {})
+        mine = dict(qs.get(subj) or {})
+        if lim == "off":
+            mine.pop(a.act, None)
+        else:
+            mine[a.act] = lim
+        if mine:
+            qs[subj] = mine
+        else:
+            qs.pop(subj, None)
+        if qs:
+            c["quotas"] = qs
+        else:
+            c.pop("quotas", None)
+    mb.edit_config(me["name"], "perm-quota", fn, {"subject": subj, "action": a.act, "limit": lim})
+    group = subj in QUOTA_GROUPS
+    who = [p["name"] for p in mb.participants(True) if p["role"] == ROLE_SCOPES[subj]] if group else [subj]
+    whose = ("角色组 %s 的" % subj) if group else "你的"
+    if lim == "off":
+        word = "去掉了%s%s配额" % (whose, QUOTA_ZH[a.act])
+    elif lim == "none":
+        word = "把%s%s设为不限次数" % (whose, QUOTA_ZH[a.act])
+    else:
+        word = "把%s%s配额设为 %s" % (whose, QUOTA_ZH[a.act], quota_zh(lim))
+    notify_system(mb, who, "perm", "%s %s%s。即时生效；用 perm show（MCP：mailbox_perm show）查看。" % (
+        me["name"], word, "（你在这个角色组里；点名给你的配额优先）" if group else ""), me["name"], "配额变更")
+    rows = [{"name": n, "quota": quota_rows(mb, mb.get(n))} for n in who if mb.get(n)]
+    if a.json:
+        emit_json({"subject": subj, "action": a.act, "limit": lim, "participants": rows})
+    else:
+        emit("已%s %s 的%s配额%s" % ("去掉" if lim == "off" else "设定", subj, QUOTA_ZH[a.act],
+                                ("：" + quota_zh(lim)) if lim != "off" else ""))
+        for r in rows:
+            if r["quota"].get(a.act):
+                v = r["quota"][a.act]
+                emit("  %s 现在：%s，本窗口已用 %d" % (r["name"], quota_zh(v["limit"]), v["used"]))
     return 0
 
 
@@ -3043,6 +3489,8 @@ def cmd_send(a):
         emit("（演练，未投递）将投到：%s" % "、".join(g[0] for g in groups))
         emit(preview.decode("utf-8").rstrip("\n"))
         return 0
+    if me is not USER:
+        quota_take(mb, me, "send")
     results = []
     for box, t in groups:
         r = mb.deliver(box, render, tag=tag, start=a.start)
@@ -3051,6 +3499,7 @@ def cmd_send(a):
         mb.log("sent", {"at": iso_utc(), "from": me["name"], "to": names_all, "cc": [c["name"] for c in cc],
                         "file": r["file"], "sha256": r["sha256"], "bytes": r["bytes"], "urgent": bool(a.urgent),
                         "reply_to": reply_ref, "corrects": corr_ref})
+        ring(mb, [n for n in mb.members(box) if n != me["name"]])
     if me is not USER:
         own = [r["file"] for r in results if r["box"] in mb.boxes_of(me)]
         last = {"at": iso_utc(), "file": results[-1]["file"]}
@@ -3742,6 +4191,7 @@ class Watcher(object):
                     self.flush()
                     reason = "removed"
                     return 0
+                bell = bell_key(self.mb, self.me["name"])  # 先取门铃再检查：检查期间才响的也不会漏
                 try:
                     letters = self.mb.scan()[0]
                 except CliError as e:
@@ -3787,10 +4237,7 @@ class Watcher(object):
                     reason = "timeout"
                     return 3 if once else 0
                 pause = 1.0 if (self.events or self.unstable) else self.a.interval
-                if self.stop_event is not None:
-                    self.stop_event.wait(pause)
-                else:
-                    time.sleep(pause)
+                bell_wait(self.mb, self.me["name"], pause, bell, self.stop_event)  # 门铃一响就提前查
         except KeyboardInterrupt:
             reason = "interrupted"
             return 130
@@ -4038,7 +4485,7 @@ def emit_lines(prefix, text):
 
 
 def talk_lines(mb, x):
-    head = "#%d %s %s" % (x["seq"], fmt_when(mb, x.get("at")), x.get("from") or "?")
+    head = "#%d %s %s" % (x["seq"], fmt_when(mb, x.get("at")), x.get("from") or "系统")
     if x.get("kind", "msg") != "msg":
         return ["%s · %s" % (head, x.get("text") or "")]
     flags = ("[急]" if x.get("urgent") else "") + (("（回复 #%d）" % x["reply_to"]) if x.get("reply_to") else "")
@@ -4067,6 +4514,8 @@ def cmd_notify_send(a):
         mb.require_perm(me, "notify", p)
     cc = cc_controller(mb, me, people)
     to = [p["name"] for p in people]
+    if me is not USER:
+        quota_take(mb, me, "notify")
     recs = []
     for n in to + ([cc["name"]] if cc else []):
         ref = {"to": to}
@@ -4125,7 +4574,7 @@ def talk_after_post(mb, me, a, meta, rec, created=False):
     wait = float(getattr(a, "wait", 0) or 0)
     replies = []
     if wait > 0:
-        replies = poll_until(wait, lambda: talk_replies(mb, me, cid, rec["seq"])) or []
+        replies = poll_until(wait, lambda: talk_replies(mb, me, cid, rec["seq"]), interval=1.0, bell=(mb, me["name"])) or []
         if replies and not mb.read_only:
             advance_seen(mb, me["name"], talk={cid: max(x["seq"] for x in replies)})
     data = {"conv": talk_brief(meta), "message": rec, "created": created, "online": online, "queue_position": pos,
@@ -4166,7 +4615,7 @@ def cmd_talk_start(a):
     for p in people:
         mb.require_perm(me, "talk", p)
     cc = cc_controller(mb, me, people)
-    meta = talk_create(mb, me, people + ([cc] if cc else []), a.topic or "")
+    meta = talk_create(mb, me, people + ([cc] if cc else []), a.topic or "", charge=lambda: quota_take(mb, me, "call"))
     if cc:
         with FileLock(mb.p("locks", "talk-%s.lock" % meta["id"])):
             append_seq(talk_log_path(mb, meta["id"]), _talk_record(
@@ -4199,7 +4648,8 @@ def cmd_talk_call(a):
     if not a.new:
         meta = talk_find_pair(mb, me, who, cc)
     if meta is None:
-        meta = talk_create(mb, me, [who] + ([cc] if cc else []), a.topic or "%s 呼叫 %s" % (me["name"], who["name"]))
+        meta = talk_create(mb, me, [who] + ([cc] if cc else []), a.topic or "%s 呼叫 %s" % (me["name"], who["name"]),
+                           charge=lambda: quota_take(mb, me, "call"))
         created = True
     rec, meta = talk_post(mb, me, meta["id"], text, urgent=a.urgent)
     return talk_after_post(mb, me, a, meta, rec, created)
@@ -4241,9 +4691,11 @@ def cmd_talk_read(a):
         emit_json({"conv": talk_brief(meta), "messages": shown, "unread": len(unread), "total": len(msgs)})
         return 0
     b = talk_brief(meta)
-    emit("通话 %s%s｜%s｜成员 %s%s｜共 %d 条，未读 %d" % (
-        cid, ("「%s」" % b["topic"]) if b["topic"] else "", "进行中" if b["state"] == "open" else "已结束",
-        "、".join(b["members"]), ("｜已退出 " + "、".join(b["left"])) if b["left"] else "", len(msgs), len(unread)))
+    cap = int((b["limits"] or {}).get("max_turns") or 0)
+    emit("通话 %s%s｜%s｜成员 %s%s｜共 %d 条，未读 %d%s" % (
+        cid, ("「%s」" % b["topic"]) if b["topic"] else "", talk_state_zh(b),
+        "、".join(b["members"]), ("｜已退出 " + "、".join(b["left"])) if b["left"] else "", len(msgs), len(unread),
+        ("｜发言 %d/%d" % (len(talk_turns(msgs)), cap)) if cap else ""))
     for x in shown:
         for l in talk_lines(mb, x):
             emit("  " + l)
@@ -4275,7 +4727,7 @@ def cmd_talk_list(a):
     for r in rows:
         last = r["last"]
         emit("  %s%s｜%s｜成员 %s｜未读 %d%s" % (
-            r["id"], ("「%s」" % r["topic"]) if r["topic"] else "", "进行中" if r["state"] == "open" else "已结束",
+            r["id"], ("「%s」" % r["topic"]) if r["topic"] else "", talk_state_zh(r),
             "、".join(r["members"]), r["unread"],
             ("｜最后 #%d %s %s：%s" % (last["seq"], fmt_when(mb, last["at"]), last["from"], last["text"])) if last else ""))
     if not rows:
@@ -4308,7 +4760,7 @@ def cmd_talk_next(a):
     def head():
         q = talk_queue(mb, me["name"])
         return q if q else None
-    q = poll_until(a.wait, head) if (a.wait or 0) > 0 else head()
+    q = poll_until(a.wait, head, interval=1.0, bell=(mb, me["name"])) if (a.wait or 0) > 0 else head()
     if not q:
         if a.json:
             emit_json({"empty": True})
@@ -4346,7 +4798,14 @@ def cmd_talk_change(a):
             mb.require_perm(me, "broadcast")
         meta = talk_meta(mb, cid, fresh=True) or {}
         cc = cc_controller(mb, me, talk_people(mb, meta, but=me["name"]) + people) if meta else None
-    rec, meta = talk_change(mb, me, cid, a.op, people, cc)
+    burst = getattr(a, "burst", None)
+    if burst is not None and burst != "off" and parse_burst(burst) is None:
+        raise CliError("--burst 只能是 off，或「条数/秒数」如 20/300（条数 2–10000，秒数 10–86400）", 2)
+    max_turns = getattr(a, "max_turns", None)
+    if max_turns is not None and not 0 <= max_turns <= 100000:
+        raise CliError("--max-turns 须在 0–100000 之间（0 表示不限）", 2)
+    reason = text_arg(a, "暂停原因", required=False) if a.op == "pause" else ""
+    rec, meta = talk_change(mb, me, cid, a.op, people, cc, reason=reason or "", max_turns=max_turns, burst=burst)
     if a.json:
         emit_json({"conv": talk_brief(meta), "record": rec})
     else:
@@ -4369,7 +4828,7 @@ def cmd_talk_wait(a):
                 if un:
                     out.append((meta, un))
         return out
-    got = poll_until(a.timeout, check)
+    got = poll_until(a.timeout, check, interval=1.0, bell=(mb, me["name"]))
     if not got:
         if a.json:
             emit_json({"timeout": True})
@@ -4421,7 +4880,8 @@ def job_lines(mb, q, j, full=False):
     return out
 
 
-def queue_wait_final(mb, name, jid, seconds):
+def queue_wait_final(mb, name, jid, seconds, who=None):
+    """等任务结束。who 是投放者时，任务完成或失败的通知会按响他的门铃，等待方随即醒来。"""
     def check():
         try:
             q = queue_view(mb, name)
@@ -4429,7 +4889,7 @@ def queue_wait_final(mb, name, jid, seconds):
         except CliError:
             return None
         return (q, j) if j["status"] in JOB_FINAL else None
-    return poll_until(seconds, check)
+    return poll_until(seconds, check, interval=1.0 if who else 0.5, bell=(mb, who) if who else None)
 
 
 def emit_job_result(mb, a, q, j, extra=None):
@@ -4530,6 +4990,8 @@ def cmd_queue_push(a):
         if not mb.can(me, "queue.admin", name):
             raise CliError("没有队列 %s；请主控先 queue create %s" % (name, name), 2)
         create = lambda: queue_new(name, me)
+    if me is not USER:
+        quota_take(mb, me, "queue.push")
 
     def fn(q, notes):
         if len(queue_pending(q)) >= QUEUE_MAX_PENDING:
@@ -4551,7 +5013,7 @@ def cmd_queue_push(a):
         return dict(j)
     j, q = queue_edit(mb, name, fn, create=create, actor=me["name"])
     if (a.wait or 0) > 0:
-        got = queue_wait_final(mb, name, j["id"], a.wait)
+        got = queue_wait_final(mb, name, j["id"], a.wait, who=me["name"])
         if got:
             emit_job_result(mb, a, got[0], got[1])
             return 0
@@ -4612,7 +5074,7 @@ def cmd_queue_take(a):
                 return None
             state["key"], state["at"] = key, time.time()
             return queue_try_take(mb, me, name)
-        got = poll_until(a.wait, tick)
+        got = poll_until(a.wait, tick, bell=(mb, me["name"]))
     if got is None:
         if a.json:
             emit_json({"empty": True, "queue": name})
@@ -5315,6 +5777,19 @@ def cmd_selftest(a):
     c3, o3, e3 = run("notify", "list", "--as", "helper-c", "--json")
     ok(c == 0 and c2 == 0 and any(x["kind"] == "job-done" for x in json.loads(o3)["items"]),
        "队列：投放、领取、完成，结果通知回投放者", e or e2 or e3)
+    run("perm", "reset", "helper-a", "--as", "helper-c")
+    run("roster", "policy", "--as", "helper-c", "--talk-max-turns", "2", "--talk-burst", "off")
+    c, o, e = run("talk", "call", "helper-d", "--as", "helper-a", "--text", "一", "--wait", "0", "--json")
+    cid = json.loads(o)["conv"]["id"] if c == 0 else "c0"
+    run("talk", "say", cid, "--as", "helper-d", "--text", "二")
+    c2, o2, e2 = run("talk", "say", cid, "--as", "helper-a", "--text", "三")
+    c3, o3, e3 = run("talk", "resume", cid, "--as", "helper-c")
+    c4, o4, e4 = run("talk", "say", cid, "--as", "helper-a", "--text", "三")
+    ok(c == 0 and c2 != 0 and "已暂停" in e2 and c3 == 0 and c4 == 0, "通话到了发言上限自动暂停，主控让它继续", e or e2 or e3 or e4)
+    run("perm", "quota", "helper-a", "notify", "1/h", "--as", "helper-c")
+    c, o, e = run("notify", "send", "--as", "helper-a", "--to", "helper-c", "--text", "1")
+    c2, o2, e2 = run("notify", "send", "--as", "helper-a", "--to", "helper-c", "--text", "2")
+    ok(c == 0 and c2 != 0 and "配额用完" in e2, "配额：主控按人设定，用完后拒绝", e or e2)
     run("join", "--as", "newbie", "--model", "qwen-3")
     c, o, e = run("roster", "approve", "newbie", "--as", "helper-c")
     ok(c == 0 and "newbie" in run("roster")[1], "新模型申请加入，主控批准", e)
@@ -5466,6 +5941,9 @@ def build_parser():
     r.add_argument("--assistant-to-assistant", choices=("allow", "cc-controller", "deny"))
     r.add_argument("--broadcast", choices=("controller", "anyone"))
     r.add_argument("--inactive-send", choices=("deny", "allow"))
+    r.add_argument("--talk-max-turns", type=int, help="新建通话最多几条发言，到了自动暂停（0 表示不限；默认 %d）" % TALK_TURNS_DEFAULT)
+    r.add_argument("--talk-burst", help="新建通话里两方快速来回到「条数/秒数」就自动暂停，如 20/300；off 关闭（默认 %s）"
+                   % TALK_BURST_DEFAULT)
     r.set_defaults(func=cmd_roster_policy)
 
     s = sp("perm", "权限：查看；授予、收回、重置、改角色预设、发身份令牌（只有主控或用户能改）")
@@ -5494,6 +5972,12 @@ def build_parser():
     r.add_argument("--remove", action="append")
     r.add_argument("--reset", action="store_true", help="恢复为由通信策略推出的预设")
     r.set_defaults(func=cmd_perm_preset)
+    r = ps_.add_parser("quota", parents=[common], help="配额：一段时间内最多发言、开通话、发信、发通知、投任务几次"
+                                                       "（不给参数列出全部；改配额只有主控或用户能做）")
+    r.add_argument("subject", nargs="?", help="参与方名，或 @assistants、@observers")
+    r.add_argument("act", nargs="?", choices=QUOTA_ACTIONS, help="限制什么")
+    r.add_argument("limit", nargs="?", help="次数/窗口，如 60/h、10/m、500/d；none 明确不限；off 去掉这一条")
+    r.set_defaults(func=cmd_perm_quota)
     r = ps_.add_parser("token", parents=[common], help="给某人（或 user）设身份令牌，防止 --as 冒充")
     r.add_argument("name", help="参与方名或 user")
     r.add_argument("--clear", action="store_true", help="清除令牌")
@@ -5669,11 +6153,18 @@ def build_parser():
     r.add_argument("conv", nargs="?", help="只等这个通话（默认本方全部通话）")
     r.add_argument("--timeout", type=float, default=600)
     r.set_defaults(func=cmd_talk_wait)
-    for op, help_ in (("invite", "邀请别人加入通话"), ("leave", "退出通话"), ("close", "结束通话（发起人或主控）")):
+    for op, help_ in (("invite", "邀请别人加入通话"), ("leave", "退出通话"), ("close", "结束通话（发起人或主控）"),
+                      ("pause", "暂停通话：除主控和用户外都不能再发言（主控或用户）"),
+                      ("resume", "让暂停的通话继续，或改通话上限（主控或用户）")):
         r = ts.add_parser(op, parents=[common], help=help_)
         r.add_argument("conv")
         if op == "invite":
             r.add_argument("--to", required=True)
+        if op == "pause":
+            text_opts(r, "暂停原因")
+        if op == "resume":
+            r.add_argument("--max-turns", type=int, help="新的发言上限（0 表示不限；不给时若因到了上限而暂停，就再给一轮）")
+            r.add_argument("--burst", help="快速来回到「条数/秒数」就再暂停，如 20/300；off 关闭")
         r.set_defaults(func=cmd_talk_change, op=op)
 
     s = sp("queue", "工作队列：投任务、排队领取（租约、优先级、到期回收）、等结果")

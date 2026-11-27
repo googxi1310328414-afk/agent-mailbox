@@ -22,12 +22,15 @@
 - **多模型自由通话**：
   - 一对一或多方通话，任何模型之间都能直接对话。
   - `mailbox_call` 发出后同步等对方回复，等待期间发进度通知；有紧急来信时提前返回。
+  - 即时送达：写入方按响对方的「门铃」，等待中的一方 0.1 秒内醒来，一轮呼叫往返的等待约 0.2 秒（不含模型思考）。
   - 回复连同全文送达，能邀请、退出、结束；主控与旁听者可以旁听。
+  - 安全阀：新建的通话最多 40 条发言，两方快速来回也会自动暂停，等主控决定继续还是结束，防止模型之间停不下来。
 - **主控分配权限**：
   - 权限有发信、广播、通知、通话、旁听、队列投放、领取、管理、状态板、代管花名册。
   - 角色有默认预设，由原来的通信策略推出，行为与 1.0 一致。
   - 主控可以按人授予或收回，范围可以细到某个人（`talk:kimi-1`）、某个角色组（`send:@assistants`）或某个队列（`queue.take:review`）。
   - 改动即时生效，本人会收到通知。
+  - 配额：按人或按角色组限制一段时间内的发言、新开通话、发信、发通知、投任务次数（如 `20/h`）。
   - 可选的身份令牌防止用 `--as` 冒充主控来绕开权限。
 - **独立运行**：
   - 主控用 `--init` 直接建好信箱。新模型用 `--join` 申请加入，主控审批时可以顺带授权。
@@ -82,21 +85,26 @@ agent-mailbox --mailbox /path/to/mailbox init --controller lead --as user
 agent-mailbox --mailbox /path/to/mailbox --as lead roster add kimi-1 --model kimi-k2
 agent-mailbox --mailbox /path/to/mailbox --as kimi-1 talk call lead --text "T-3 要不要连带改接口？" --wait 120
 agent-mailbox --mailbox /path/to/mailbox --as lead perm revoke kimi-1 broadcast
+agent-mailbox --mailbox /path/to/mailbox --as lead perm quota @assistants call 20/h
 ```
 
 ## 工具一览（19 个）
 
 - **信件**：`mailbox_send`、`mailbox_inbox`、`mailbox_read`、`mailbox_mark`、`mailbox_search`。
-- **通话**：`mailbox_call`（呼叫并等回复）、`mailbox_talk`（发起、发言、读、来电队列、接下一个、邀请、退出、结束）。
+- **通话**：`mailbox_call`（呼叫并等回复）、`mailbox_talk`（发起、发言、读、来电队列、接下一个、邀请、退出、结束；主控暂停、继续）。
 - **通知**：`mailbox_notify`。
 - **队列**：`mailbox_queue`（建、投、领、完成、失败、放回、续租、取消、查看、等结果）。
-- **权限**：`mailbox_perm`（目录、查看、判定、授予、收回、重置、角色预设）。
+- **权限**：`mailbox_perm`（目录、查看、判定、授予、收回、重置、角色预设、配额）。
 - **等待**：`mailbox_wait`。
 - **身份与花名册**：`mailbox_whoami`、`mailbox_roster`（含加入申请的审批）、`mailbox_who`。
 - **续接**：`mailbox_tasks`、`mailbox_notes`、`mailbox_status_board`。
 - **其它**：`mailbox_doctor`、`mailbox_template`。
 
-另有资源（`mailbox://inbox`、`mailbox://notifications`、`mailbox://talk` 可订阅）和 10 个信件模板提示词。
+另有资源（`mailbox://inbox`、`mailbox://notifications`、`mailbox://talk` 可订阅；`mailbox://doc/mcp` 是工具的详细用法）和 10 个信件模板提示词。
+
+工具清单按身份裁剪：只列本方权限够得着的工具、动作和参数，权限变了推送 `tools/list_changed`，省下每个模型的上下文。
+- 实测（粗估）：助手约 4000 tokens，旁听者约 2900；1.2 时每人约 5400。
+- 只做通话的模型可以用 `--tools core`（8 个常用工具，约 1900）；需要固定清单时用 `--tools all`。
 
 ## 文档
 

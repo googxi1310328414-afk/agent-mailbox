@@ -13,7 +13,7 @@ usage: mailbox.py [-h] [--mailbox MAILBOX] [--config CONFIG] [--state-dir STATE_
                   [--token-file TOKEN_FILE] [--read-only] [--json] [--version]
                   <命令> ...
 
-agent-mailbox 1.2.1：多模型协作信箱（主控唯一，助手可增减）
+agent-mailbox 1.3.0：多模型协作信箱（主控唯一，助手可增减）
 
 positional arguments:
   <命令>
@@ -331,12 +331,17 @@ usage: mailbox.py roster policy [-h] [--mailbox MAILBOX] [--config CONFIG] [--st
                                 [--token-file TOKEN_FILE] [--read-only] [--json]
                                 [--assistant-to-assistant {allow,cc-controller,deny}]
                                 [--broadcast {controller,anyone}] [--inactive-send {deny,allow}]
+                                [--talk-max-turns TALK_MAX_TURNS] [--talk-burst TALK_BURST]
 
 options:
   -h, --help            show this help message and exit
   --assistant-to-assistant {allow,cc-controller,deny}
   --broadcast {controller,anyone}
   --inactive-send {deny,allow}
+  --talk-max-turns TALK_MAX_TURNS
+                        新建通话最多几条发言，到了自动暂停（0 表示不限；默认 40）
+  --talk-burst TALK_BURST
+                        新建通话里两方快速来回到「条数/秒数」就自动暂停，如 20/300；off 关闭（默认 20/300）
 
 通用选项:
   --mailbox, -m MAILBOX
@@ -453,6 +458,7 @@ positional arguments:
     revoke              收回权限（显式收回，压过角色预设）
     reset               去掉显式条目，回到角色预设（不给权限则全部去掉）
     preset              查看或改角色预设
+    quota               配额：一段时间内最多发言、开通话、发信、发通知、投任务几次（不给参数列出全部；改配额只有主控或用户能做）
     token               给某人（或 user）设身份令牌，防止 --as 冒充
 
 options:
@@ -645,6 +651,35 @@ options:
   --add ADD
   --remove REMOVE
   --reset               恢复为由通信策略推出的预设
+
+通用选项:
+  --mailbox, -m MAILBOX
+                        信箱目录（默认取环境变量 AGENT_MAILBOX_DIR，再取 ~/.agent-mailbox/default.json）
+  --config CONFIG       花名册文件（默认 <信箱>/.agent-mailbox/config.json）
+  --state-dir STATE_DIR
+                        控制目录（默认 <信箱>/.agent-mailbox）
+  --as ME               本方参与方名（默认环境变量 AGENT_MAILBOX_ME）
+  --token-file TOKEN_FILE
+                        身份令牌文件（花名册给本方设了令牌时用；也可用环境变量 AGENT_MAILBOX_TOKEN）
+  --read-only           只读：不写游标、锁、在线状态，拒绝投递
+  --json                输出 JSON
+```
+
+## perm quota：配额
+
+```text
+usage: mailbox.py perm quota [-h] [--mailbox MAILBOX] [--config CONFIG] [--state-dir STATE_DIR] [--as ME]
+                             [--token-file TOKEN_FILE] [--read-only] [--json]
+                             [subject] [{talk,call,send,notify,queue.push}] [limit]
+
+positional arguments:
+  subject               参与方名，或 @assistants、@observers
+  {talk,call,send,notify,queue.push}
+                        限制什么
+  limit                 次数/窗口，如 60/h、10/m、500/d；none 明确不限；off 去掉这一条
+
+options:
+  -h, --help            show this help message and exit
 
 通用选项:
   --mailbox, -m MAILBOX
@@ -1120,6 +1155,8 @@ positional arguments:
     invite              邀请别人加入通话
     leave               退出通话
     close               结束通话（发起人或主控）
+    pause               暂停通话：除主控和用户外都不能再发言（主控或用户）
+    resume              让暂停的通话继续，或改通话上限（主控或用户）
 
 options:
   -h, --help            show this help message and exit
@@ -1428,6 +1465,66 @@ positional arguments:
 
 options:
   -h, --help            show this help message and exit
+
+通用选项:
+  --mailbox, -m MAILBOX
+                        信箱目录（默认取环境变量 AGENT_MAILBOX_DIR，再取 ~/.agent-mailbox/default.json）
+  --config CONFIG       花名册文件（默认 <信箱>/.agent-mailbox/config.json）
+  --state-dir STATE_DIR
+                        控制目录（默认 <信箱>/.agent-mailbox）
+  --as ME               本方参与方名（默认环境变量 AGENT_MAILBOX_ME）
+  --token-file TOKEN_FILE
+                        身份令牌文件（花名册给本方设了令牌时用；也可用环境变量 AGENT_MAILBOX_TOKEN）
+  --read-only           只读：不写游标、锁、在线状态，拒绝投递
+  --json                输出 JSON
+```
+
+## talk pause：暂停
+
+```text
+usage: mailbox.py talk pause [-h] [--mailbox MAILBOX] [--config CONFIG] [--state-dir STATE_DIR] [--as ME]
+                             [--token-file TOKEN_FILE] [--read-only] [--json] [--text TEXT | --file FILE]
+                             [--allow-secret]
+                             conv
+
+positional arguments:
+  conv
+
+options:
+  -h, --help            show this help message and exit
+  --text TEXT           暂停原因
+  --file FILE           从文件读暂停原因（长内容用它，免得 shell 转义）
+  --allow-secret        确认不是凭据时放行疑似凭据
+
+通用选项:
+  --mailbox, -m MAILBOX
+                        信箱目录（默认取环境变量 AGENT_MAILBOX_DIR，再取 ~/.agent-mailbox/default.json）
+  --config CONFIG       花名册文件（默认 <信箱>/.agent-mailbox/config.json）
+  --state-dir STATE_DIR
+                        控制目录（默认 <信箱>/.agent-mailbox）
+  --as ME               本方参与方名（默认环境变量 AGENT_MAILBOX_ME）
+  --token-file TOKEN_FILE
+                        身份令牌文件（花名册给本方设了令牌时用；也可用环境变量 AGENT_MAILBOX_TOKEN）
+  --read-only           只读：不写游标、锁、在线状态，拒绝投递
+  --json                输出 JSON
+```
+
+## talk resume：继续或改上限
+
+```text
+usage: mailbox.py talk resume [-h] [--mailbox MAILBOX] [--config CONFIG] [--state-dir STATE_DIR] [--as ME]
+                              [--token-file TOKEN_FILE] [--read-only] [--json] [--max-turns MAX_TURNS]
+                              [--burst BURST]
+                              conv
+
+positional arguments:
+  conv
+
+options:
+  -h, --help            show this help message and exit
+  --max-turns MAX_TURNS
+                        新的发言上限（0 表示不限；不给时若因到了上限而暂停，就再给一轮）
+  --burst BURST         快速来回到「条数/秒数」就再暂停，如 20/300；off 关闭
 
 通用选项:
   --mailbox, -m MAILBOX

@@ -95,6 +95,7 @@ mailbox.py ... --as <你> talk invite c3 --to glm-1     # 邀请；talk leave �
 - 呼叫时会告诉你对方监视是否在线、这个通话排在对方来电队列第几位；超时不是失败，回复到了照样送来。
 - 收到 `TALK` 事件就用 `talk say` 回复；同时有几个来电时用 `talk next` 按顺序接。
 - 在通话里发言，要对其中每个在任成员都有 `talk` 权限；主控随时可以加入任何通话，有 `talk.audit` 的旁听者可以读任何通话。
+- 新建的通话最多 40 条发言；只有两方时，5 分钟内来回 20 条也会自动暂停，防止停不下来的循环。暂停后只有主控和用户能说话：**不要另开通话或换工具绕过**，等主控 `talk resume`（可带 `--max-turns`）或 `talk close`。主控也可以 `talk pause` 叫停。默认值由主控用 `roster policy --talk-max-turns / --talk-burst` 改。
 
 ## 5. 工作队列：排队派活、领活
 
@@ -187,6 +188,8 @@ mailbox.py ... --as <主控> perm revoke kimi-1 talk:claude-a                 # 
 mailbox.py ... --as <主控> perm reset kimi-1                                # 回到角色预设
 mailbox.py ... --as <主控> perm preset assistant --remove broadcast         # 改整个角色的预设
 mailbox.py ... --as <主控> perm token lead --out ~/.lead.token              # 身份令牌：防止别人用 --as 冒充（另见 perm token user）
+mailbox.py ... --as <主控> perm quota @assistants call 20/h                # 配额：每人每小时最多新开 20 个通话；perm quota 列出全部
+mailbox.py ... --as <主控> perm quota kimi-1 talk 60/h                     # 点名的优先；none 明确不限，off 去掉
 ```
 
 - 权限写作「键[:范围]」，范围可以是某人、角色组（`@controller`、`@assistants`、`@observers`）或队列名：
@@ -194,7 +197,8 @@ mailbox.py ... --as <主控> perm token lead --out ~/.lead.token              # 
 - 主控与用户永远拥有全部权限。助手默认能写信、通知、通话、投任务、领任务、写状态板，不能广播。旁听者默认只能旁听通话。
 - 默认预设由通信策略推出：`policy` 设成助手互通 `deny`，预设就只剩对主控和旁听者的权限；设成广播 `anyone`，预设就带上 `broadcast`。
 - 判定：显式条目里取最具体的一条（点名 > 角色组 > 不限），同样具体时收回优先；没有显式条目才看角色预设。
-- **被拒时不要换身份、换工具或手写文件绕过去**：如实告诉主控需要什么权限，由主控决定。
+- 配额限制一段时间内的次数：`talk`（发言）、`call`（新开通话）、`send`（发信）、`notify`（发通知）、`queue.push`（投任务），写作 `60/h`、`10/m`、`500/d`。主控与用户不受限；用完时操作被拒，主控收到通知。
+- **被拒时不要换身份、换工具或手写文件绕过去**：如实告诉主控需要什么权限或配额，由主控决定。
 
 ## 11. 体检与出错
 

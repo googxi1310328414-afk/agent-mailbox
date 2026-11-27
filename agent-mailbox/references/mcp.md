@@ -39,6 +39,7 @@ python -I -B <skill>/scripts/mcp_server.py --mailbox <信箱目录> --as <本方
 | `--join`、`--join-role` | 关、`assistant` | 本方不在花名册里（或已不在任）时申请加入，等主控批准 |
 | `--model`、`--harness`、`--note` | 环境变量 `AGENT_MAILBOX_MODEL`、`AGENT_MAILBOX_HARNESS` | `--init`、`--join` 时登记的模型、宿主与附言 |
 | `--token-file` | 无 | 身份令牌文件；也可设环境变量 `AGENT_MAILBOX_TOKEN`（优先） |
+| `--tools` | `auto`（或环境变量 `AGENT_MAILBOX_TOOLS`） | 工具清单：`auto` 按本方权限只列能用的工具和动作；`all` 全部列出、不随权限变；`core` 只列常用的 8 个；也可写逗号分隔的工具名（可省去 `mailbox_` 前缀），见下文「工具清单随身份变化」 |
 | `--version` | — | 打印版本号后退出，不起服务；输出与 `agent-mailbox --version` 相同 |
 
 同一身份只该有一个监视。用 MCP 时，不要再给同一身份挂命令行 `watch`。
@@ -93,7 +94,7 @@ tool_timeout_sec = 600
 
 | 工具 | 用途 |
 |---|---|
-| `mailbox_whoami` | 本方身份、角色、收件箱、监视状态、待取事件数 |
+| `mailbox_whoami` | 本方身份、角色、收件箱、权限与配额、监视状态、待取事件数 |
 | `mailbox_inbox` | 未读（或全部）信件列表 |
 | `mailbox_read` | 读信并标已读（`peek` 只看） |
 | `mailbox_send` | 投递：`to`、`subject` + `body`，或 `draft`（自带标题）；`urgent`、`reply_to`、`corrects`、`attach`、`dry_run` |
@@ -103,18 +104,29 @@ tool_timeout_sec = 600
 | `mailbox_tasks` | 任务清单、等待对象、等待文件 |
 | `mailbox_notes` | 续接备忘 |
 | `mailbox_status_board` | 状态板 |
-| `mailbox_call` | 呼叫另一个模型并等它回复：沿用一对一通话（或用 `conv` 指定通话），等到回复、通话结束或超时 |
-| `mailbox_talk` | 通话：`start`、`say`、`read`、`list`、`queue`（来电队列）、`next`（接下一个来电）、`invite`、`leave`、`close` |
+| `mailbox_call` | 呼叫另一个模型并等它回复：沿用一对一通话（或用 `conv` 指定通话），等到回复、通话结束或暂停、超时 |
+| `mailbox_talk` | 通话：`start`、`say`、`read`、`list`、`queue`（来电队列）、`next`（接下一个来电）、`invite`、`leave`、`close`；`pause`、`resume`（暂停、继续或改发言上限）只有主控和用户能做 |
 | `mailbox_notify` | 通知：`send` 发轻量提醒，`list` 看本方通知 |
 | `mailbox_queue` | 工作队列：`create`、`push`、`take`（可排队等）、`done`、`fail`、`release`、`renew`、`cancel`、`show`、`job`、`wait`、`list` |
-| `mailbox_perm` | 权限：`list`、`show`、`check`；`grant`、`revoke`、`reset`、`preset` 只有主控能做 |
-| `mailbox_roster` | 花名册：查看；增减助手、上限、加入申请（`requests`、`approve`、`reject`）由主控或 `roster.admin` 做；交接、策略只有主控能做 |
+| `mailbox_perm` | 权限与配额：`list`、`show`、`check`；`grant`、`revoke`、`reset`、`preset`、`quota` 只有主控能做 |
+| `mailbox_roster` | 花名册：查看；增减助手、上限、加入申请（`requests`、`approve`、`reject`）由主控或 `roster.admin` 做；交接、策略（含 `talk_max_turns`、`talk_burst`）只有主控能做 |
 | `mailbox_who` | 各参与方在线与进度（含通话未读、通知未看） |
 | `mailbox_doctor` | 只读体检 |
 | `mailbox_template` | 信件模板 |
 
-工具出错时返回 `isError: true`，并附原因（损坏字、凭据、标题点名、只读、权限不足等），模型可以据此改正后重试。
+工具出错时返回 `isError: true`，并附原因（损坏字、凭据、标题点名、只读、权限不足、配额用完、通话已暂停等），模型可以据此改正后重试。
 权限不足的错误会写明缺哪条权限、依据是什么，以及主控该执行的 `perm grant …`；模型应如实转告，不要换身份或绕路。
+
+### 工具清单随身份变化
+
+每个模型的上下文里一直放着工具清单，所以清单只列本方用得上的部分（`--tools auto`，默认）：
+- 没有某项权限的动作不列，只有这些动作用到的参数也不列。比如助手看不到 `mailbox_perm` 的授权、配额动作，也看不到 `mailbox_talk` 的 `pause`、`resume`；旁听者看不到 `mailbox_send`、`mailbox_call`。
+- 主控授予或收回权限、批准加入、交接主控之后，服务推送 `notifications/tools/list_changed`（新协议经 `subscriptions/listen` 的 `toolsListChanged`），客户端再拉一次清单就是新的。
+- 清单只是展示：参数校验仍按完整定义，没刷新清单的客户端照样能调；能不能做由权限判定，清单里没列的动作调了也只会得到「权限不足」。
+- 申请加入还没批准时，只列批准前能用的工具。
+
+实测（粗估 token 数，只算名字、说明和参数定义；服务说明另有 700–800）：主控约 5000，助手约 4000，旁听者约 2900，`--tools core` 约 1900；1.2 时每人都是约 5400。
+不认识 `tools/list_changed` 的客户端，可以用 `--tools all` 固定列出全部。
 
 ## 通话、队列与阻塞等待
 
@@ -122,10 +134,19 @@ tool_timeout_sec = 600
   - 按 `progressToken` 每隔 `--progress-interval` 秒发一次进度通知，写明对方监视是否在线、这个通话排在对方来电队列第几位；
   - 有紧急来信或紧急通知到达时提前返回（`interrupted: true`），打断它的那封信随结果送到；
   - 超时不是错误：结果里有通话编号，回复到了会作为【新事件】送来。
-- 回复连同此前没送过的消息作为结果交出，并记为已送达，不会在别的工具结果里再报一次。
+- 回复连同此前没送过的消息作为结果交出，并记为已送达，不会在别的工具结果里再报一次。通话被暂停或结束时也立即返回。
 - `mailbox_talk` 的 `start`、`say` 也能带 `wait_seconds` 等回复；`next` 带 `wait_seconds` 时排队等来电。
 - `mailbox_queue` 的 `take` 带 `wait_seconds` 时排队等活：队列文件变了才去领，至少每 10 秒试一次（租约可能悄悄到期）。`push` 带 `wait_seconds`、`wait` 动作都等任务结束拿结果。
 - 客户端工具超时较短时（例如 Codex 未配置 `tool_timeout_sec`），把等待秒数设得比它短；等不到就再调一次，不会丢东西。
+
+### 通话上限、暂停与配额
+
+防止模型之间停不下来地你来我往：
+- **发言上限**：新建的通话最多 40 条发言（用户说的不算），到了自动暂停。主控用 `mailbox_roster policy` 的 `talk_max_turns` 改默认值（0 表示不限）。
+- **快速来回**：只有两方、又没有用户参与时，300 秒内来回 20 条就自动暂停（`talk_burst`，写作「条数/秒数」，`off` 关闭）。
+- 暂停后只有主控和用户能发言；其他人发言、另开同一批人的通话都会被拒。主控收到 `NOTIFY [talk-paused]`，看过记录后用 `mailbox_talk resume`（可带 `max_turns` 改上限；不带时若因上限而停，就再给一轮）或 `close`。主控也可以随时 `pause`。
+- 上限和快速来回的设置在建通话时从策略复制进来；改策略只影响之后新建的通话，单个通话用 `resume` 改。1.3 之前建的通话不受限。
+- **配额**：主控用 `mailbox_perm quota` 按人或按角色组（`@assistants`、`@observers`）限制一段时间内的次数：`talk`（发言）、`call`（新开通话）、`send`（发信）、`notify`（发通知）、`queue.push`（投任务）。写法如 `60/h`、`10/m`、`500/d`，`none` 明确不限，`off` 去掉。点名的配额优先于角色组的；主控与用户不受限。用完时操作被拒，主控收到 `NOTIFY [quota]`（每个窗口一次）。
 
 ## 申请加入（`--join`）
 
@@ -147,8 +168,12 @@ tool_timeout_sec = 600
 
 其它事件只在内存里排队，最多积 200 批，超出时如实提示丢了几批。这类事件包括：总账新行、工作日志、等待文件、报状态提醒、等待超时、心跳、角色变化、别处点名。
 
+**门铃**：发言、发通知、投信之后，写入方会按响收件方的门铃（控制目录下 `bell/<名字>`，只是追加一个字节）。
+服务每 0.1 秒看一眼本方门铃，响了就立刻叫醒正在等的 `mailbox_wait`、`mailbox_call` 和队列等待，不必等轮询间隔。
+默认参数下一轮呼叫往返的等待（不含模型思考）约 0.2 秒，1.2 时约 2 秒。门铃只是提示，收件一律以状态为准：门铃没响（比如对方还是旧版本）时退回原来的轮询间隔。
+
 后台监视发现变化时，同时走四条路，客户端支持哪条就用哪条：
-1. `notifications/claude/channel`：Claude Code 以频道方式加载时直接注入会话；其它客户端会忽略它。信件、通话消息（`TALK`）、通知（`NOTIFY`）都走这里。
+1. `notifications/claude/channel`：Claude Code 以频道方式加载时直接注入会话；其它客户端会忽略它。信件、通话消息（`TALK`）、通知（`NOTIFY`）都走这里。正在 `mailbox_wait` 的模型已经从等待结果里拿到的，不再重复推送。
 2. `notifications/resources/updated`：订阅了 `mailbox://inbox`（新信）、`mailbox://talk`（通话消息）、`mailbox://notifications`（通知）的客户端会收到。旧协议用 `resources/subscribe`，新协议用 `subscriptions/listen`。只有这三个资源可订阅。
 3. `mailbox_wait`：正在等的调用立即返回。
 4. 其它信箱工具的结果末尾附「【新事件】」：在 1 之外，只有这一条会把事件记为已送达。
@@ -166,7 +191,7 @@ tool_timeout_sec = 600
 - **资源**：
   - 可订阅：`mailbox://inbox`、`mailbox://notifications`、`mailbox://talk`；
   - `mailbox://roster`、`mailbox://who`、`mailbox://tasks`、`mailbox://notes`、`mailbox://queues`、`mailbox://perm`；
-  - `mailbox://doc/protocol`、`mailbox://doc/roles`；
+  - `mailbox://doc/protocol`、`mailbox://doc/roles`、`mailbox://doc/mcp`（就是本文，工具的详细用法）；
   - 最近 20 封信 `mailbox://letter/<文件名>`。
   - 模板地址：`mailbox://letter/{file}`、`mailbox://status/{key}`、`mailbox://talk/{conv}`（通话记录，只读不记为已看）、`mailbox://queue/{name}`。只能读信箱目录里符合命名的信件。
 - **提示词**：10 个信件模板（`registration`、`ack`、`delivery`、`status`、`urgent`、`correction`、`handover`、`blocked`、`roster-change`、`question`），参数是 `to`、`subject`、`reply_to`。在 Claude Code 里显示为斜杠命令。

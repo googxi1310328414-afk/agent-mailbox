@@ -124,6 +124,9 @@ to-<箱>-<线程>-<KEY>-STATUS.json        KEY：大写字母数字，可用 - �
 | `policy.assistant_to_assistant` | 助手互通：`allow` / `cc-controller`（自动抄送主控）/ `deny` | `allow` |
 | `policy.broadcast` | 谁能广播：`controller` / `anyone` | `controller` |
 | `policy.inactive_send` | 不在任者能否发信 | `deny` |
+| `policy.talk_max_turns` | 新建通话最多几条发言，到了自动暂停；0 不限（见第 12 节） | 40 |
+| `policy.talk_burst` | 新建通话里两方快速来回到「条数/秒数」就自动暂停；`off` 关闭 | `20/300` |
+| `quotas` | 配额：`{"<参与方名或 @assistants、@observers>": {"talk": "60/h", ...}}`（见第 12 节） | 无 |
 | `secret_patterns` | 追加的凭据正则 | `[]` |
 | `presets` | 角色预设的整体改写：`{"assistant": [...], "observer": [...]}`（见第 10 节） | 无（由通信策略推出） |
 | `user_token_sha256` | `--as user` 的身份令牌哈希 | 无 |
@@ -215,8 +218,9 @@ to-<箱>-<线程>-<KEY>-STATUS.json        KEY：大写字母数字，可用 - �
 - `kind` 取值：
   - `note`：有人发的通知；
   - `job`、`job-done`、`job-failed`：派活、领取、取消，任务完成，任务失败；
-  - `perm`：权限变更；
-  - `join`、`joined`：加入申请，加入已批准。
+  - `perm`：权限或配额变更；
+  - `join`、`joined`：加入申请，加入已批准；
+  - `talk-paused`：通话自动暂停（发给主控）；`quota`：谁的配额用完了（发给主控，每个窗口一次）。
 - 文字最多 4 KB，经卫生检查与凭据拦截。
 - 收件人游标里的 `notify_seen` 是已看序号：MCP 送达、命令行 `watch` 报出、`notify list` 列出，都把它往前推。
 - 归档：追加之后若通知流超过 512 KB，在同一把锁里把旧条目移到 `<名>.archive.jsonl`。
@@ -228,7 +232,8 @@ to-<箱>-<线程>-<KEY>-STATUS.json        KEY：大写字母数字，可用 - �
 
 通话：
 - `talk/c<N>.json` 记 `id`、`topic`、`created_by`、`state`（open / closed）、`members`。每个成员有 `name`、`since`（加入时的序号，之前的消息不算未读）、`left`。
-- `talk/c<N>.jsonl` 每行一条：`{"seq", "at", "from", "kind", "text", "reply_to", "urgent"}`。`kind` 取 `msg`（发言）、`join`、`leave`、`close`。文字最多 16 KB。
+  1.3 起另有 `limits`（`max_turns`、`burst`，建通话时从策略复制）、`paused`（`at`、`by`，自动暂停时为空串、`reason`）、`resumed_at` 与 `resumed_seq`（主控让它继续时的时间与最后一条序号）。
+- `talk/c<N>.jsonl` 每行一条：`{"seq", "at", "from", "kind", "text", "reply_to", "urgent"}`。`kind` 取 `msg`（发言）、`join`、`leave`、`close`、`pause`、`resume`；自动暂停的记录 `from` 为空串（显示为「系统」）。文字最多 16 KB。
 - 编号 `c<N>` 在 `locks/talk.lock` 里取最大号加一，元数据文件排他创建；发言、邀请、退出、结束在 `locks/talk-c<N>.lock` 里进行。
 - 成员游标里的 `talk_seen` 记每个通话的已看序号，未读就是序号之后、别人发的记录。
 - **来电队列**：有未读发言的进行中通话，紧急的在前，其余按最早一条未读的时间先来后到。`talk next` 取队首并记为已看；呼叫方看到的「排第几位」就是在这个队列里的位置。
@@ -249,4 +254,23 @@ to-<箱>-<线程>-<KEY>-STATUS.json        KEY：大写字母数字，可用 - �
 加入申请 `requests/<名>.json`：
 - 字段：`{"name", "model", "harness", "display", "note", "role", "at", "status": "pending|approved|rejected", "decided_by", "decided_at", "reason"}`。
 - 同时待批的申请最多 20 个。重复申请只刷新内容，不重复通知。
+
+## 12. 门铃、通话上限与配额
+
+门铃 `bell/<名>`：
+- 发言、邀请、暂停与继续、发通知、投信之后，写入方给每个收件方的门铃文件追加一个字节（自己的不按）；文件到 64 KB 就截短，截短本身也算响。
+- 等待方先记下本方门铃的 inode、大小与修改时间，再做完整检查；之后每 0.1 秒看一眼，变了就立刻重查。MCP 服务的 `mailbox_wait`、`mailbox_call`、队列等待，命令行的 `watch`、`talk call/say --wait`、`talk wait`、`talk next --wait`、`queue take/push --wait` 都这样等。
+- 门铃只是提示，收件一律以状态为准：漏响（比如写入方是旧版本）只是退回原来的轮询间隔，多响只是多查一次。只读模式不写门铃。
+
+通话上限与自动暂停：
+- 每条发言之后检查：发言数（用户说的不算）到了 `limits.max_turns`；或只有两方、近 `burst` 秒内（且在 `resumed_seq` 之后）来回了 `burst` 条、其间用户没说话。满足其一就把 `paused` 写进元数据，追加一条 `pause` 记录，按响全体成员的门铃，并通知主控。
+- 暂停中只有主控和用户能发言；其他人发言、邀请别人、另开成员相同的通话都会被拒。
+- `talk pause` 由主控或用户手动暂停。`talk resume` 清掉 `paused`，记下 `resumed_at`、`resumed_seq`：带 `--max-turns` 就改上限（0 不限），不带时若因上限而停，上限改为「已有条数 + 策略条数（至少 10）」；带 `--burst` 改快速来回的门槛。
+- 没有 `limits` 的通话（1.3 之前建的）不受限。
+
+配额：
+- 花名册 `quotas` 的键是参与方名或 `@assistants`、`@observers`，值是 `{动作: 写法}`。动作：`talk`（每条发言）、`call`（每次新开通话）、`send`（每次发信，演练不算）、`notify`（每次发通知）、`queue.push`（每个任务）。写法「次数/窗口」，窗口 `m`、`h`、`d`；`none` 明确不限（压过角色组的配额）。
+- 判定：点名的优先于角色组的；主控与用户不受限。
+- 用量记在 `usage/<名>.json`：每个动作在窗口内的时间戳（最多「次数」个），在 `locks/usage-<名>.lock` 里读改写。用完时操作被拒，并在每个窗口里最多通知主控一次（`warned`）。
+- `perm quota` 由主控或用户设置，`perm show` 显示生效的配额与本窗口已用次数。
 - 批准时按申请加入花名册：已是前任的，重新在任，旧箱里的历史信记为已读。可顺带写 `allow`、`deny`，这一步只有主控能做。

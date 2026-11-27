@@ -70,115 +70,189 @@ I = lambda d: {"type": "integer", "description": d}
 SA = lambda d: {"type": "array", "items": {"type": "string"}, "description": d}
 E = lambda vals, d: {"type": "string", "enum": list(vals), "description": d}
 
-TOOLS = [
-    ("mailbox_whoami", "本方身份、角色、收件箱、有效权限、来电队列、信箱位置、后台监视状态与待送达事件数；申请加入还没批准时显示申请状态。"
-     "不确定自己是谁、该收哪个箱、能做什么时先调它。",
-     obj({}), {"readOnlyHint": True}),
-    ("mailbox_inbox", "列出本方未读信件（all=true 列全部；others=true 连同共享箱里点名给别人的）。返回每封信的编号引用、发件人、标题、是否紧急。",
-     obj({"all": B("列出全部而不只未读"), "others": B("也列共享箱里点名给别人的信"), "box": S("只看某个收件箱"),
-          "since": I("只看编号大于它的信"), "limit": I("最多列几封（取最新的）")}), {"readOnlyHint": True}),
-    ("mailbox_read", "读信并标为已读（peek=true 只看不标）。引用可写 941、claude-941、codex-338-URGENT 或完整文件名。行动前先读原信，不凭摘要猜。",
-     obj({"refs": SA("要读的信"), "peek": B("只看不标已读")}, ["refs"]), {"readOnlyHint": False}),
-    ("mailbox_send", "投递一封信：排他编号（绝不覆盖）、信头时间现取、写后读回返回 SHA-256。助手不写 to 时默认写给主控。"
-     "正文用 body（配 subject），或用 draft 给出首行为「# 致 <收件人>：<主题>」的完整草稿。会拒收损坏字、疑似凭据、超过 64 KB 的信。",
-     obj({"to": S("收件人：参与方名或别名、controller、all、assistants，可逗号分隔"), "subject": S("主题（配合 body）"),
-          "body": S("正文 Markdown"), "draft": S("完整草稿（首行为 # 标题），与 body 二选一"),
-          "urgent": B("紧急：文件名带 -URGENT，只用于测试失败、业务异常、需要立刻决定的事"),
-          "reply_to": S("回复哪封"), "corrects": S("更正哪封（原件不改）"), "attach": SA("附件文件路径：投递时实算字节数与 SHA-256"),
-          "dry_run": B("只预览不投递"), "force_title": B("不检查标题点名"), "allow_secret": B("确认不是凭据时放行"),
-          "normalize": B("自动去 BOM、CRLF 换成 LF"), "start": I("起始编号（取不小于它的第一个空号）")}),
-     {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False}),
-    ("mailbox_wait", "等来信、通话消息、通知或其它信箱事件：有未送达的立即返回，超时返回空；申请加入还没批准时等批准结果。"
-     "需要等主控或助手回复时用它，不要自己轮询。客户端工具超时较短时把 timeout_seconds 设小一点（默认 50 秒），返回后可再调。",
-     obj({"timeout_seconds": I("最长等待秒数，1–3600")}), {"readOnlyHint": True}),
-    ("mailbox_mark", "把信标为已读，或用 unread=true 重新标为未读（会再次提醒）。",
-     obj({"refs": SA("信件引用"), "all": B("本方各箱全部"), "from_num": I("编号不小于它的全部"), "box": S("配合 from_num 限定收件箱"),
-          "unread": B("标为未读")}), {"readOnlyHint": False}),
-    ("mailbox_search", "按正则搜信（标题或全文）。",
-     obj({"pattern": S("正则"), "box": S("只搜某箱"), "from": S("只看某参与方发的信"), "since": I("只看编号大于它的信"),
-          "title_only": B("只搜标题"), "ignore_case": B("忽略大小写"), "limit": I("最多几封")}, ["pattern"]),
-     {"readOnlyHint": True}),
-    ("mailbox_tasks", "本方任务清单、等待对象、等待文件（会话重启后从这里续）。action：show / set / remove / replace / waiting_on / "
-     "clear_waiting / wait_add / wait_remove。在等外部时登记 waiting_on 或 wait_add 后直接结束本轮。",
-     obj({"action": E(("show", "set", "remove", "replace", "waiting_on", "clear_waiting", "wait_add", "wait_remove"), "动作"),
-          "id": S("任务编号（set、remove）"), "status": E(core.TASK_STATES, "任务状态（set）"), "next": S("下一步（set）"),
-          "tasks": {"type": "array", "description": "整表替换（replace）", "items": obj(
-              {"id": S("任务编号"), "status": E(core.TASK_STATES, "状态"), "next": S("下一步")}, ["id", "status"])},
-          "what": S("在等谁、等什么（waiting_on）"), "path": S("文件或目录的绝对路径（wait_add、wait_remove）"),
-          "note": S("等的是什么（wait_add）")}, ["action"]), {"readOnlyHint": False}),
-    ("mailbox_notes", "本方续接备忘：show 查看，append 追加一段（带时间），replace 整体覆盖。",
-     obj({"action": E(("show", "append", "replace"), "动作"), "text": S("内容（append、replace）")}, ["action"]),
-     {"readOnlyHint": False}),
-    ("mailbox_status_board", "状态板：长任务的实时快照（整文件原子替换的 JSON）。action：list / get / put。",
-     obj({"action": E(("list", "get", "put"), "动作"), "key": S("板名：大写字母数字，可用 - 连接，如 RUN-W1"),
-          "data": {"type": "object", "description": "put 的 JSON 对象"}, "to": S("写给谁的箱（默认主控箱）"),
-          "box": S("get 时限定收件箱")}, ["action"]), {"readOnlyHint": False}),
-    ("mailbox_call", "呼叫另一个参与方（别的模型）并同步等它回复，用于多模型之间的自由通话：沿用与对方的一对一通话（没有就新建；"
-     "也可用 conv 指定已有通话），发出 text 后一直等到对方回复、通话结束或超时。等待期间发进度通知（对方监视是否在线、本通话排在"
-     "其来电队列第几位）。超时不是错误：通话编号会返回，回复到了会作为【新事件】送来，也可用 mailbox_talk read 取。需要 talk 权限。",
-     obj({"to": S("呼叫谁（参与方名或别名）；给了 conv 时可省"), "text": S("要说的话（最多 16 KB）"),
-          "conv": S("在这个已有通话里说（如 c12）"), "topic": S("新建通话时的主题"), "new": B("另起一个新通话"),
-          "urgent": B("紧急：排到对方来电队列最前"), "timeout_seconds": I("最长等多少秒，0–3600（默认同 mailbox_wait）")},
-         ["text"]), {"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False}),
-    ("mailbox_talk", "通话（多模型自由对话，一对一或多方）：start 发起（to 可写多人）、say 发言、read 读记录（记为已看）、"
-     "list 本方通话与未读、queue 来电队列（等你回复的通话，紧急优先、先来后到）、next 接下一个来电（取队首通话的未读消息）、"
-     "invite / leave / close。收到 TALK 事件后用 say 回复；要立刻得到回答用 mailbox_call。start、say 可带 wait_seconds 等回复，"
-     "next 可带 wait_seconds 排队等来电。",
-     obj({"action": E(("start", "say", "read", "list", "queue", "next", "invite", "leave", "close"), "动作"),
-          "conv": S("通话编号，如 c12（say、read、invite、leave、close）"),
-          "to": S("对方，可逗号分隔，也可写 assistants、all（start、invite）"), "topic": S("主题（start）"),
-          "text": S("内容，最多 16 KB（start、say）"), "reply_to": I("回复第几条（say）"), "urgent": B("紧急（start、say）"),
-          "wait_seconds": I("等回复或等来电的秒数，0–3600（start、say、next）"), "since": I("read：只看第几条之后的"),
-          "unread": B("read：只看未读"), "limit": I("read：最多几条"), "peek": B("read、next：不记为已看"),
-          "all": B("list：连同已结束的"), "everyone": B("list：信箱里全部通话（要 talk.audit）"),
-          "who": S("queue：看谁的来电队列（默认本方；看别人要 talk.audit）")}, ["action"]),
-     {"readOnlyHint": False, "destructiveHint": False}),
-    ("mailbox_notify", "通知：send 给别人发一条轻量提醒（不占信件编号，最多 4 KB；to 可写名字、controller、assistants、all），"
-     "list 看本方通知（默认只列没看过的）。任务派发与完成、权限变更、加入申请等系统消息也走这里，会作为 NOTIFY 事件推送。",
-     obj({"action": E(("send", "list"), "动作"), "to": S("发给谁（send）"), "text": S("内容（send）"),
-          "title": S("标题（send，可选）"), "urgent": B("紧急（send）"), "all": B("list：列最近的全部"),
-          "limit": I("list：最多几条"), "peek": B("list：不记为已看")}, ["action"]), {"readOnlyHint": False}),
-    ("mailbox_queue", "工作队列（排队等待）：push 投任务（可设优先级、指派给某人、wait_seconds 等结果），take 领下一个任务"
-     "（wait_seconds>0 时排队等，期间发进度通知），done / fail / release / renew / cancel 处置，show / job 查看，wait 等任务结束"
-     "拿结果，list 全部队列，create 建队列或改设置（queue.admin）。领到的任务有租约，到期没完成会放回排队；fail 带 retry 还有次数就重排。",
-     obj({"action": E(("list", "create", "push", "take", "done", "fail", "release", "renew", "cancel", "show", "job", "wait"), "动作"),
-          "queue": S("队列名：小写字母数字，可用 - 连接"), "job": I("任务号（done、fail、release、renew、cancel、job、wait）"),
-          "title": S("任务标题（push）"), "text": S("push：任务内容；done：结果；fail、cancel、release：说明"),
-          "priority": I("push：优先级，越大越先领"), "to": S("push：指派给谁（只有他能领）"),
-          "retry": B("fail：还有尝试次数就放回排队"), "wait_seconds": I("push、take、wait：等待秒数，0–3600"),
-          "all": B("show：列出全部已结束的"), "desc": S("create：说明"), "lease_seconds": I("create：租约秒数"),
-          "max_attempts": I("create：最多尝试次数"), "consumers": SA("create：领取名单（空数组表示不限）"),
-          "notify": B("create：新任务是否通知可领的人")}, ["action"]), {"readOnlyHint": False, "destructiveHint": False}),
-    ("mailbox_perm", "权限：list 权限目录与角色预设，show 有效权限（name 默认本方），check 判定某人能否用某权限；grant 授予、"
-     "revoke 收回、reset 回到角色预设、preset 改角色预设——这四项只有主控能做。权限写作 键[:范围]：talk、talk:kimi-1、"
-     "send:@assistants、queue.take:review。被拒时不要换身份或绕路，向主控申请。",
-     obj({"action": E(("list", "show", "check", "grant", "revoke", "reset", "preset"), "动作"),
-          "name": S("参与方（show、check、grant、revoke、reset）"), "perms": SA("权限列表（grant、revoke、reset；preset 的 set/add/remove）"),
-          "perm": S("check：要判定的权限，可写成 键:范围"), "target": S("check：对谁（参与方、角色组或队列名）"),
-          "role": E(core.PRESET_ROLES, "preset：哪个角色"), "mode": E(("show", "set", "add", "remove", "reset"), "preset：怎么改（默认 show）")},
-         ["action"]), {"readOnlyHint": False}),
-    ("mailbox_roster", "花名册：show 查看；add / update / remove / limit / requests / approve / reject 由主控或有 roster.admin 权限的人做，"
-     "handover / policy 只有主控能做（update 本人可改自己的 model、harness、session、note）。任何时刻恰有一名在任主控，助手数量可增减；"
-     "新模型可以申请加入（requests 列出待批），approve 时可顺带 allow / deny 授权（只有主控能授权）。",
-     obj({"action": E(("show", "add", "update", "remove", "handover", "limit", "policy", "requests", "approve", "reject"), "动作"),
-          "name": S("参与方名（add、update、remove、handover、approve、reject）"), "role": E(("assistant", "observer"), "add、approve 的角色"),
-          "allow": SA("approve：顺带授予的权限"), "deny": SA("approve：顺带收回的权限"), "reason": S("reject：理由"),
-          "all": B("requests：连同已批、已拒的"),
-          "model": S("模型"), "harness": S("宿主或客户端"), "session": S("会话号"), "display": S("显示名"),
-          "box": S("收件箱（默认用名字；多方可共用一箱）"), "aliases": SA("add：别名；update：追加的别名"),
-          "alias_remove": SA("update：移除的别名"), "note": S("备注"), "activate": E(("assistant", "observer"), "update：让前任重新在任"),
-          "old_role": E(("former", "assistant", "observer"), "handover：旧主控转为"), "old_box": S("handover：旧主控转助手时的收件箱"),
-          "no_inherit": B("handover：新主控不继承旧主控的已读"), "n": I("limit：在任助手上限"),
-          "assistant_to_assistant": E(("allow", "cc-controller", "deny"), "policy：助手互通"),
-          "broadcast": E(("controller", "anyone"), "policy：谁能广播"), "inactive_send": E(("deny", "allow"), "policy：不在任者能否发信")},
-         ["action"]), {"readOnlyHint": False}),
-    ("mailbox_who", "在线与进度总览：各参与方是否在监视、未读数、上次发信、未完成任务、在等什么。", obj({}), {"readOnlyHint": True}),
-    ("mailbox_doctor", "只读体检：花名册、命名、同号多信、CR 与损坏字、残留锁、投递后被改动的信。",
-     obj({"all_threads": B("体检目录里全部线程")}), {"readOnlyHint": True}),
-    ("mailbox_template", "取信件模板（登记、回执、交付、状态、紧急、更正、交接、阻断、助手调整、取舍提问）；不给 name 列出全部。",
-     obj({"name": S("模板名")}), {"readOnlyHint": True}),
+# 工具定义。每个模型的上下文里一直放着这份清单，所以说明尽量短，细节见资源 mailbox://doc/mcp。
+# 多动作工具带动作表：（动作，一句话说明，可见条件，用到的参数）。tools/list 按本方身份与权限只列能用的动作，
+# 参数也只留这些动作用得到的；校验参数时仍按完整定义（客户端没刷新清单时照样能用，真正的判定在权限检查）。
+# 可见条件：None 总是可见；"boss" 只有主控和用户；"admin" 主控、用户或有 roster.admin 的人；
+# 权限键（或几个权限键的元组）：对至少一个对象有其中一项权限才列出。
+def tool(name, desc, params=(), ann=None, actions=None, need=None, required=()):
+    return {"name": name, "desc": desc, "params": list(params), "ann": ann or {"readOnlyHint": False},
+            "actions": actions, "need": need, "required": list(required)}
+
+
+RO = {"readOnlyHint": True}
+WRITE = {"readOnlyHint": False, "destructiveHint": False}
+TASK_ITEM = obj({"id": {"type": "string"}, "status": {"type": "string", "enum": list(core.TASK_STATES)},
+                 "next": {"type": "string"}}, ["id", "status"])
+
+TOOL_SPECS = [
+    tool("mailbox_whoami", "本方身份、角色、收件箱、权限与配额、来电队列、后台监视状态。不确定自己是谁、能做什么时先调它。", ann=RO),
+    tool("mailbox_inbox", "列出本方未读信件：编号、发件人、标题、是否紧急。", [
+        ("all", B("列全部，不只未读"), None), ("others", B("连同共享箱里点名给别人的"), None),
+        ("box", S("只看某个收件箱"), None), ("since", I("只看编号大于它的"), None), ("limit", I("最多几封（取最新的）"), None)],
+         ann=RO),
+    tool("mailbox_read", "读信并标为已读（peek 只看不标）。行动前先读原信，不凭摘要猜。", [
+        ("refs", SA("信件引用，如 941、claude-941 或完整文件名"), None), ("peek", B("只看不标已读"), None)], required=["refs"]),
+    tool("mailbox_send", "投信：排他编号、绝不覆盖，写后读回核对 SHA-256；助手不写 to 时写给主控。正文用 subject 加 body，"
+                         "或用 draft 给完整草稿（首行「# 致 收件人：主题」）。拒收损坏字、疑似凭据和超过 64 KB 的信。", [
+        ("to", S("收件人：名字、controller、all、assistants，可逗号分隔"), None), ("subject", S("主题"), None),
+        ("body", S("正文 Markdown"), None), ("draft", S("完整草稿，与 body 二选一"), None),
+        ("urgent", B("紧急：只用于测试失败、业务异常、要立刻决定的事"), None), ("reply_to", S("回复哪封"), None),
+        ("corrects", S("更正哪封（原件不改）"), None), ("attach", SA("附件路径：投递时实算大小与 SHA-256"), None),
+        ("dry_run", B("只预览，不投递"), None), ("force_title", B("不检查标题点名"), None),
+        ("allow_secret", B("确认不是凭据时放行"), None), ("normalize", B("去 BOM，CRLF 换成 LF"), None),
+        ("start", I("起始编号（取不小于它的第一个空号）"), None)],
+         ann={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False}, need="send"),
+    tool("mailbox_wait", "等新的信、通话消息、通知等事件：有就立即返回，超时返回空。要等回复时用它，不要自己轮询；"
+                         "客户端工具超时较短时把 timeout_seconds 设小（默认 50），返回后再调。",
+         [("timeout_seconds", I("最长等几秒，1–3600"), None)], ann=RO),
+    tool("mailbox_mark", "标为已读，或 unread=true 重新标为未读（会再提醒）。", [
+        ("refs", SA("信件引用"), None), ("all", B("本方各箱全部"), None), ("from_num", I("编号不小于它的全部"), None),
+        ("box", S("配合 from_num 限定收件箱"), None), ("unread", B("标为未读"), None)]),
+    tool("mailbox_search", "按正则搜信（标题或全文）。", [
+        ("pattern", S("正则"), None), ("box", S("只搜某箱"), None), ("from", S("只看某人发的"), None),
+        ("since", I("只看编号大于它的"), None), ("title_only", B("只搜标题"), None), ("ignore_case", B("忽略大小写"), None),
+        ("limit", I("最多几封"), None)], ann=RO, required=["pattern"]),
+    tool("mailbox_tasks", "本方任务清单与等待登记，会话重启后从这里续。在等外部时登记 waiting_on 或 wait_add 后直接结束本轮。", [
+        ("id", S("任务编号"), None), ("status", E(core.TASK_STATES, "任务状态"), None), ("next", S("下一步"), None),
+        ("tasks", {"type": "array", "description": "replace 的整表", "items": TASK_ITEM}, None),
+        ("what", S("在等谁、等什么"), None), ("path", S("文件或目录的绝对路径"), None), ("note", S("等的是什么"), None)],
+         actions=[("show", "查看", None, ()), ("set", "新增或改一项", None, ("id", "status", "next")),
+                  ("remove", "删一项", None, ("id",)), ("replace", "整表替换", None, ("tasks",)),
+                  ("waiting_on", "登记在等谁", None, ("what",)), ("clear_waiting", "清除等待对象", None, ()),
+                  ("wait_add", "登记等待文件", None, ("path", "note")), ("wait_remove", "去掉等待文件", None, ("path",))]),
+    tool("mailbox_notes", "本方续接备忘。", [("text", S("内容"), None)],
+         actions=[("show", "查看", None, ()), ("append", "追加一段（带时间）", None, ("text",)),
+                  ("replace", "整体覆盖", None, ("text",))]),
+    tool("mailbox_status_board", "状态板：长任务的实时快照（整文件原子替换的 JSON）。", [
+        ("key", S("板名：大写字母数字，可用 - 连接，如 RUN-W1"), None), ("data", {"type": "object", "description": "put 的 JSON 对象"}, None),
+        ("to", S("put 写给谁的箱（默认主控箱）"), None), ("box", S("get 时限定收件箱"), None)],
+         actions=[("list", "列出", None, ()), ("get", "读一块", None, ("key", "box")),
+                  ("put", "写一块", "status", ("key", "data", "to"))]),
+    tool("mailbox_call", "呼叫另一个模型并同步等它回复：沿用与对方的一对一通话（没有就新建，也可用 conv 指定），"
+                         "等到回复、通话结束或暂停、超时为止。超时不是错误，回复到了会作为【新事件】送来。", [
+        ("to", S("呼叫谁；给了 conv 可省"), None), ("text", S("要说的话，最多 16 KB"), None),
+        ("conv", S("在这个已有通话里说，如 c12"), None), ("topic", S("新通话的主题"), None), ("new", B("另开一个新通话"), None),
+        ("urgent", B("紧急：排到对方来电队列最前"), None), ("timeout_seconds", I("最长等几秒，0–3600（默认同 mailbox_wait）"), None)],
+         ann={"readOnlyHint": False, "destructiveHint": False, "idempotentHint": False}, need="talk", required=["text"]),
+    tool("mailbox_talk", "通话：多模型一对一或多方自由对话。收到 TALK 事件用 say 回复；要立刻得到回答用 mailbox_call。", [
+        ("conv", S("通话编号，如 c12"), None), ("to", S("对方，可逗号分隔，也可写 assistants、all"), None),
+        ("topic", S("主题"), None), ("text", S("内容，最多 16 KB；pause 时是原因"), None), ("reply_to", I("回复第几条"), None),
+        ("urgent", B("紧急"), None), ("wait_seconds", I("等回复或等来电的秒数，0–3600"), None),
+        ("since", I("read：只看第几条之后的"), None), ("unread", B("read：只看未读"), None), ("limit", I("read：最多几条"), None),
+        ("peek", B("read、next：不记为已看"), None), ("all", B("list：连同已结束的"), None),
+        ("everyone", B("列信箱里全部通话"), "talk.audit"), ("who", S("看谁的来电队列（默认本方）"), "talk.audit"),
+        ("max_turns", I("新的发言上限（0 不限；不给时若因到了上限而暂停就再给一轮）"), None)],
+         ann=WRITE,
+         actions=[("start", "发起并说第一句", "talk", ("to", "topic", "text", "urgent", "wait_seconds")),
+                  ("say", "发言", "talk", ("conv", "text", "reply_to", "urgent", "wait_seconds")),
+                  ("read", "读记录（记为已看）", None, ("conv", "since", "unread", "limit", "peek")),
+                  ("list", "本方通话与未读", None, ("all", "everyone")),
+                  ("queue", "来电队列（紧急优先、先来后到）", None, ("who",)),
+                  ("next", "接下一个来电", None, ("wait_seconds", "peek")),
+                  ("invite", "邀请", "talk", ("conv", "to")), ("leave", "退出", None, ("conv",)),
+                  ("close", "结束（发起人或主控）", None, ("conv",)),
+                  ("pause", "暂停：只剩主控和用户能发言", "boss", ("conv", "text")),
+                  ("resume", "让暂停的通话继续，或改发言上限", "boss", ("conv", "max_turns"))]),
+    tool("mailbox_notify", "通知：轻量提醒，不占信件编号。派活、任务结果、权限变更、加入申请等系统消息也走这里（NOTIFY 事件）。", [
+        ("to", S("发给谁：名字、controller、assistants、all"), None), ("text", S("内容，最多 4 KB"), None),
+        ("title", S("标题（可选）"), None), ("urgent", B("紧急"), None), ("all", B("list：列最近的全部"), None),
+        ("limit", I("list：最多几条"), None), ("peek", B("list：不记为已看"), None)],
+         actions=[("send", "发一条", "notify", ("to", "text", "title", "urgent")),
+                  ("list", "看本方通知（默认只列没看过的）", None, ("all", "limit", "peek"))]),
+    tool("mailbox_queue", "工作队列：任务按优先级排队，领到的有租约，到期没完成就放回排队；几个模型同时领也不会领到同一个。", [
+        ("queue", S("队列名：小写字母数字，可用 - 连接"), None), ("job", I("任务号"), None), ("title", S("任务标题"), None),
+        ("text", S("push 时是任务内容，done 时是结果，其余是说明"), None), ("priority", I("优先级，越大越先领"), None),
+        ("to", S("指派给谁（只有他能领）"), None), ("retry", B("还有尝试次数就放回排队"), None),
+        ("wait_seconds", I("push、take、wait 的等待秒数，0–3600"), None), ("all", B("show：列出全部已结束的"), None),
+        ("desc", S("队列说明"), None), ("lease_seconds", I("租约秒数"), None), ("max_attempts", I("最多尝试次数"), None),
+        ("consumers", SA("领取名单（空数组表示不限）"), None), ("notify", B("新任务是否通知可领的人"), None)],
+         ann=WRITE,
+         actions=[("list", "全部队列", None, ()),
+                  ("create", "建队列或改设置", "queue.admin", ("queue", "desc", "lease_seconds", "max_attempts", "consumers", "notify")),
+                  ("push", "投任务（可等结果）", "queue.push", ("queue", "title", "text", "priority", "to", "wait_seconds")),
+                  ("take", "领下一个（可排队等）", "queue.take", ("queue", "wait_seconds")),
+                  ("done", "交结果", "queue.take", ("queue", "job", "text")),
+                  ("fail", "记为失败", "queue.take", ("queue", "job", "text", "retry")),
+                  ("release", "放回排队", "queue.take", ("queue", "job", "text")),
+                  ("renew", "续租", "queue.take", ("queue", "job")),
+                  ("cancel", "取消（投放者）", ("queue.push", "queue.admin"), ("queue", "job", "text")),
+                  ("show", "查看队列", None, ("queue", "all")), ("job", "任务详情", None, ("queue", "job")),
+                  ("wait", "等任务结束拿结果", None, ("queue", "job", "wait_seconds"))]),
+    tool("mailbox_perm", "权限与配额。权限写作 键[:范围]，如 talk、talk:kimi-1、send:@assistants、queue.take:review。", [
+        ("name", S("参与方；quota 也可写 @assistants、@observers"), None), ("perms", SA("权限列表"), None),
+        ("perm", S("check 时是权限键；quota 时是 talk、call、send、notify 或 queue.push"), None),
+        ("target", S("对谁（参与方、角色组或队列名）"), None), ("role", E(core.PRESET_ROLES, "哪个角色"), None),
+        ("mode", E(("show", "set", "add", "remove", "reset"), "怎么改（默认 show）"), None),
+        ("limit", S("次数/窗口，如 60/h、10/m、500/d；none 不限；off 去掉"), None)],
+         actions=[("list", "权限目录与角色预设", None, ()), ("show", "有效权限与配额（默认本方）", None, ("name",)),
+                  ("check", "判定某人能否用某权限", None, ("name", "perm", "target")),
+                  ("grant", "授予", "boss", ("name", "perms")), ("revoke", "收回", "boss", ("name", "perms")),
+                  ("reset", "回到角色预设", "boss", ("name", "perms")), ("preset", "改角色预设", "boss", ("role", "mode", "perms")),
+                  ("quota", "设配额：一段时间内最多几次", "boss", ("name", "perm", "limit"))]),
+    tool("mailbox_roster", "花名册：恰有一名在任主控，助手可增减；新模型可申请加入，由主控审批。", [
+        ("name", S("参与方名"), None), ("role", E(("assistant", "observer"), "角色"), "admin"),
+        ("allow", SA("批准时顺带授予的权限"), "boss"), ("deny", SA("批准时顺带收回的权限"), "boss"), ("reason", S("拒绝理由"), "admin"),
+        ("all", B("连同已批、已拒的"), "admin"), ("model", S("模型"), None), ("harness", S("宿主或客户端"), None),
+        ("session", S("会话号"), None), ("display", S("显示名"), "admin"), ("box", S("收件箱（默认用名字；多方可共用）"), "admin"),
+        ("aliases", SA("别名（update 时追加）"), "admin"), ("alias_remove", SA("要移除的别名"), "admin"), ("note", S("备注"), None),
+        ("activate", E(("assistant", "observer"), "让前任重新在任"), "admin"),
+        ("old_role", E(("former", "assistant", "observer"), "旧主控转为"), None), ("old_box", S("旧主控转助手时的收件箱"), None),
+        ("no_inherit", B("新主控不继承旧主控的已读"), None), ("n", I("在任助手上限"), None),
+        ("assistant_to_assistant", E(("allow", "cc-controller", "deny"), "助手之间能否直接通信"), None),
+        ("broadcast", E(("controller", "anyone"), "谁能广播"), None), ("inactive_send", E(("deny", "allow"), "不在任者能否发信"), None),
+        ("talk_max_turns", I("新建通话最多几条发言，到了自动暂停（0 不限）"), None),
+        ("talk_burst", S("两方快速来回到「条数/秒数」就自动暂停，如 20/300；off 关闭"), None)],
+         actions=[("show", "查看", None, ()),
+                  ("update", "改资料（本人可改自己的 model、harness、session、note）", None,
+                   ("name", "model", "harness", "session", "display", "box", "aliases", "alias_remove", "note", "activate")),
+                  ("add", "加人", "admin", ("name", "role", "model", "harness", "session", "display", "box", "aliases", "note")),
+                  ("remove", "移除", "admin", ("name",)), ("limit", "在任助手上限", "admin", ("n",)),
+                  ("requests", "待批的加入申请", "admin", ("all",)), ("approve", "批准加入", "admin", ("name", "role", "allow", "deny")),
+                  ("reject", "拒绝加入", "admin", ("name", "reason")),
+                  ("handover", "交接主控", "boss", ("name", "old_role", "old_box", "no_inherit")),
+                  ("policy", "通信策略与通话上限", "boss", ("assistant_to_assistant", "broadcast", "inactive_send",
+                                                            "talk_max_turns", "talk_burst"))]),
+    tool("mailbox_who", "在线与进度：谁在监视、未读数、上次发信、未完成任务、在等什么。", ann=RO),
+    tool("mailbox_doctor", "只读体检：花名册、命名、同号多信、CR 与损坏字、残留锁、投递后被改动的信。",
+         [("all_threads", B("体检目录里全部线程"), None)], ann=RO),
+    tool("mailbox_template", "取信件模板；不给 name 列出全部。", [("name", S("模板名"), None)], ann=RO),
 ]
-TOOL_SCHEMAS = dict((t[0], t[2]) for t in TOOLS)
+TOOL_NAMES = [t["name"] for t in TOOL_SPECS]
+TOOL_CORE = ("mailbox_whoami", "mailbox_wait", "mailbox_inbox", "mailbox_read", "mailbox_send", "mailbox_call",
+             "mailbox_talk", "mailbox_notify")
+
+
+def build_tool(spec, ok=None):
+    """按可见性判定 ok(条件) 生成一项 tools/list；ok 为 None 时生成完整定义（用于校验参数）。什么都不能用时返回 None。"""
+    full = ok is None
+    see = (lambda need: True) if full else (lambda need: need is None or ok(need))
+    if not see(spec["need"]):
+        return None
+    params = dict((n, (s, need)) for n, s, need in spec["params"])
+    if spec["actions"]:
+        shown = [a for a in spec["actions"] if see(a[2])]
+        if not shown:
+            return None
+        names = [a[0] for a in shown]
+        use = {}
+        for a in shown:
+            for n in a[3]:
+                use.setdefault(n, []).append(a[0])
+        props = {"action": E(names, "动作")}
+        for n, s, need in spec["params"]:
+            if n in use and see(need):
+                props[n] = s
+        desc = "%s动作：%s。" % (spec["desc"], "；".join("%s %s" % (a[0], a[1]) for a in shown))
+        required = ["action"] + spec["required"]
+    else:
+        props = dict((n, s) for n, (s, need) in params.items() if see(need))
+        desc, required = spec["desc"], spec["required"]
+    return {"name": spec["name"], "title": spec["name"], "description": desc, "inputSchema": obj(props, required),
+            "annotations": dict(spec["ann"], openWorldHint=False)}
+
+
+TOOL_SCHEMAS = dict((t["name"], build_tool(t)["inputSchema"]) for t in TOOL_SPECS)
 
 
 def check_value(schema, v, name):
@@ -288,6 +362,13 @@ class Server(object):
         self.mem_talk = {}       # 已随回应送出、还没写进游标的通话指针（只读模式下只记在这里）
         self.mem_notify = 0
         self.urgent_gen = 0      # 每来一批紧急信件或紧急通知就加一：阻塞中的调用据此提前返回
+        self.bell_gen = 0        # 本方门铃每响一次加一：等待中的调用据此立刻重查（不必等轮询间隔）
+        self.bell_thread = None
+        self.tools_lock = threading.Lock()
+        self.tools_sig = None    # 上次交给客户端的工具清单（判断要不要推送 tools/list_changed）
+        self.tools_key = None    # 那时花名册文件的 inode、大小、修改时间
+        self.tool_pick = tool_pick(o.tools)
+        self.letters_due = None  # 刚落盘、还不到送达门槛的信最早何时可送（mailbox_wait 到点就查）
         self.wake_watch = threading.Event()
         self.join_sent = False
         self.identity = self.load_identity()
@@ -398,7 +479,8 @@ class Server(object):
             "不凭摘要猜；TALK 是通话消息（已附全文），用 mailbox_talk say 回复；NOTIFY 是通知（派活、任务结果、权限变更等）。",
             "2. 只处理写给本方的事项；点名别人的不碰。助手只做主控登记给自己的任务，收到登记或返修先发 3–5 行开工回执。",
             "3. 正式往来（登记、回执、交付、裁定）写信 mailbox_send；需要和别的模型快速商量时通话：mailbox_call 呼叫并等回复，mailbox_talk 管理通话；"
-            "轻量提醒用 mailbox_notify。不要手写信箱里的文件；信和话都要短，只写新增事实和精确路径，不贴凭据的值。",
+            "轻量提醒用 mailbox_notify。不要手写信箱里的文件；信和话都要短，只写新增事实和精确路径，不贴凭据的值。"
+            "通话被暂停（到了发言上限或像是停不下来的循环）或配额用完时，不要另开通话、换工具绕过，等主控决定。",
             "4. 谁都能做的活放队列 mailbox_queue：push 投、take 领（可排队等）、done 交结果；做不了就 release，别占着；租约到期会被收回。",
             "5. 要等回信、回话或任务时调 mailbox_wait（或 call、take 自带的等待），不要轮询空转；在等外部时用 mailbox_tasks 登记 waiting_on 后结束本轮。",
             "6. 权限由主控分配（mailbox_perm show 查看本方权限）；被拒时不要换身份、换工具或绕路，向主控说明需要什么权限。",
@@ -406,14 +488,16 @@ class Server(object):
             "不读其他会话的转写；转述主控裁定时按原信条号列全；错了另函更正（corrects），原件不改。",
         ]
         if idn.get("ok") and idn.get("role") == "controller":
-            rules.append("8. 你是主控：用 mailbox_perm 按人授予或收回权限，用 mailbox_roster requests / approve / reject 审批新模型加入，"
-                         "用 mailbox_queue create / push 建队列派活；主控在等结论时，60–90 分钟没消息就发简短的状态询问。")
+            rules.append("8. 你是主控：用 mailbox_perm 按人授予或收回权限、设配额（quota），用 mailbox_roster requests / approve / reject "
+                         "审批新模型加入，用 mailbox_queue create / push 建队列派活。通话自动暂停或谁的配额用完时你会收到 NOTIFY："
+                         "看过记录再决定 mailbox_talk resume 还是 close。在等结论时，60–90 分钟没消息就发简短的状态询问。")
         else:
             rules.append("8. 主控在等结论时，60–90 分钟没去信就发一封简短状态信。")
+        rules.append("工具的详细用法见资源 mailbox://doc/mcp。")
         return "\n".join(rules)
 
     def capabilities(self):
-        caps = {"tools": {"listChanged": False}, "resources": {"subscribe": True, "listChanged": True},
+        caps = {"tools": {"listChanged": self.o.tools != "all"}, "resources": {"subscribe": True, "listChanged": True},
                 "prompts": {"listChanged": False}, "logging": {}}
         if self.o.channel:
             caps["experimental"] = {"claude/channel": {}}
@@ -621,9 +705,28 @@ class Server(object):
 
     # ------------------------------------------------------------ 后台监视
     def ensure_watch(self):
+        if self.bell_thread is None and not self.stop.is_set():
+            self.bell_thread = threading.Thread(target=self.bell_loop, name="mailbox-bell", daemon=True)
+            self.bell_thread.start()
         if self.o.watch and self.watch_thread is None and not self.stop.is_set():
             self.watch_thread = threading.Thread(target=self.watch_loop, name="mailbox-watch", daemon=True)
             self.watch_thread.start()
+
+    def bell_loop(self):
+        """每 0.1 秒看一眼本方门铃：有人给本方发言、发通知、投信时它会响，响了就叫醒所有正在等的调用。
+        不开后台监视（--no-watch）时也照常工作；门铃没响时各处原有的轮询照常兜底。"""
+        try:
+            mb = core.Mailbox(self.o.mailbox, self.o.config, self.o.state_dir, True)
+            key = core.bell_key(mb, self.o.me)
+            while not self.stop.wait(core.BELL_TICK):
+                k = core.bell_key(mb, self.o.me)
+                if k != key:
+                    key = k
+                    with self.cond:
+                        self.bell_gen += 1
+                        self.cond.notify_all()
+        except Exception as e:
+            self.log("warning", {"bell": "%s: %s" % (type(e).__name__, e)})
 
     def watch_loop(self):
         backoff = 5.0
@@ -638,6 +741,8 @@ class Server(object):
             if not self.identity.get("ok") and (self.identity.get("pending") or self.identity.get("rejected")):
                 # 等主控批准加入：每 3 秒查一次，批准后立刻开始监视
                 self.identity = self.load_identity()
+                if self.identity.get("ok"):
+                    self.refresh_tools(force=True)  # 获准加入：工具清单从「批准前」换成正式的
                 if not self.identity.get("ok"):
                     state = "申请被拒" if self.identity.get("rejected") else "等待批准"
                     if self.watch["state"] != state:
@@ -710,6 +815,7 @@ class Server(object):
             self.notify_resource("mailbox://notifications")
             if any(e.get("notify_kind") in ("perm", "joined") for e in evs):
                 self.identity = self.load_identity()  # 权限或身份变了，whoami 立刻反映
+                self.refresh_tools(force=True)
         self.log("info", {"event": "mailbox", "kinds": sorted(kinds), "count": len(evs)})
 
     def notify_resource(self, uri):
@@ -733,6 +839,8 @@ class Server(object):
         honored = {}
         if want.get("resourcesListChanged"):
             honored["resourcesListChanged"] = True
+        if want.get("toolsListChanged") and self.o.tools != "all":
+            honored["toolsListChanged"] = True
         asked = want.get("resourceSubscriptions") or []
         subs = [u for u in SUBSCRIBABLE if isinstance(asked, list) and u in asked]
         if subs:
@@ -766,13 +874,16 @@ class Server(object):
                 st = mb.state(me, scope)
                 read = set(st.get("read") or [])
                 delivered = set(st.get("delivered") or []) | self.mem_delivered
-                now, out = time.time(), []
+                now, out, due = time.time(), [], None
                 for l in scope:
                     if l.name in read or l.name in delivered:
                         continue
                     h = mb.info(l)
-                    if h is None or h.get("from") == me["name"] or now - h["mtime"] < 1.0:
-                        continue  # 自己发的不算；刚落盘不到 1 秒的下一轮再报
+                    if h is None or h.get("from") == me["name"]:
+                        continue  # 自己发的不算
+                    if now - h["mtime"] < 1.0:
+                        due = min(due or h["mtime"] + 1.0, h["mtime"] + 1.0)
+                        continue  # 刚落盘不到 1 秒（可能还没写完）的，到点再报
                     cls = mb.classify(me, l, h)
                     if cls == "other":
                         continue
@@ -780,6 +891,7 @@ class Server(object):
                                 "class": cls, "from": h.get("from") or h.get("from_token"), "title": h["title"],
                                 "mtime": mb.fmt_time(h["mtime"]), "epoch": h["mtime"], "bytes": h["size"],
                                 "path": core.slash(l.path)})
+                self.letters_due = due
                 out.sort(key=lambda x: (x["epoch"], x["file"]))
                 return out
             except (core.CliError, OSError) as e:
@@ -927,9 +1039,83 @@ class Server(object):
             self.cond.notify_all()
 
     # ------------------------------------------------------------ 工具
+    def tool_judge(self):
+        """可见性判定：按本方当前的身份与权限决定一个「可见条件」成不成立（见 TOOL_SPECS 前的说明）。"""
+        if self.o.tools == "all":
+            return lambda need: True
+        try:
+            mb = core.Mailbox(self.o.mailbox, self.o.config, self.o.state_dir, True)
+            p = mb.identity(self.o.me)
+        except core.CliError:
+            return lambda need: need is None
+        boss = core.is_boss(p)
+        admin = boss or mb.can(p, "roster.admin")
+        cache = {}
+
+        def ok(need):
+            if isinstance(need, tuple):
+                return any(ok(x) for x in need)
+            if need == "boss":
+                return boss
+            if need == "admin":
+                return admin
+            if need not in cache:
+                cache[need] = core.perm_may(mb, p, need)
+            return cache[need]
+        return ok
+
+    def tool_view(self):
+        """这一刻 tools/list 该列的工具：--tools 选定的范围内，按身份与权限只留能用的工具、动作和参数。"""
+        idn = self.identity
+        if not idn.get("ok") and (idn.get("pending") or idn.get("rejected")):
+            out = []  # 还没获准加入：只列批准前能用的
+            for spec in TOOL_SPECS:
+                if spec["name"] in ("mailbox_roster", "mailbox_perm"):
+                    spec = dict(spec, actions=[x for x in spec["actions"] if x[0] in ("show", "list")])
+                elif spec["name"] not in PENDING_TOOLS:
+                    continue
+                out.append(build_tool(spec, lambda need: need is None))
+            return out
+        ok = self.tool_judge()
+        pick = self.tool_pick
+        return [t for t in (build_tool(s, ok) for s in TOOL_SPECS if pick is None or s["name"] in pick) if t]
+
+    def config_key(self):
+        path = os.path.abspath(self.o.config) if self.o.config else os.path.join(
+            os.path.abspath(self.o.state_dir) if self.o.state_dir else os.path.join(self.o.mailbox, core.CONTROL), "config.json")
+        try:
+            st = os.stat(path)
+            return (st.st_ino, st.st_size, st.st_mtime_ns)
+        except OSError:
+            return None
+
+    def refresh_tools(self, force=False):
+        """花名册（身份、角色、权限都在里面）变了就重算工具清单；和上次交给客户端的不同时推送 tools/list_changed。"""
+        if self.o.tools == "all":
+            return
+        key = self.config_key()
+        with self.tools_lock:
+            if not force and key == self.tools_key:
+                return
+            self.tools_key = key
+            if self.tools_sig is None:
+                return  # 客户端还没要过清单，要的时候自然是新的
+            sig = json.dumps(self.tool_view(), sort_keys=True, ensure_ascii=False)
+            if sig == self.tools_sig:
+                return
+            self.tools_sig = sig
+        if self.legacy and self.ready:
+            self.notify("notifications/tools/list_changed", {})
+        for rid, f in list(self.listens.items()):
+            if f.get("toolsListChanged"):
+                self.notify("notifications/tools/list_changed", {"_meta": {META_SUB: rid}})
+
     def m_tools_list(self, p, ctx, modern):
-        return {"tools": [{"name": n, "title": n, "description": d, "inputSchema": s, "annotations": dict(a, openWorldHint=False)}
-                          for n, d, s, a in TOOLS]}
+        tools = self.tool_view()
+        with self.tools_lock:
+            self.tools_sig = json.dumps(tools, sort_keys=True, ensure_ascii=False)
+            self.tools_key = self.config_key()
+        return {"tools": tools}
 
     def m_tools_call(self, p, ctx, modern):
         name, args = p.get("name"), p.get("arguments")
@@ -966,6 +1152,7 @@ class Server(object):
                 if own:
                     d["talk"] = (own.get("talk") or []) + d["talk"]
                 ctx["delivery"] = d
+        self.refresh_tools()  # 这次调用（或别人）改了权限、角色时，清单随之更新
         return result
 
     def block(self, ctx, timeout, attempt, label, interrupt=True):
@@ -979,6 +1166,7 @@ class Server(object):
         while True:
             if ctx["cancel"].is_set() or self.stop.is_set():
                 return None, "cancelled"
+            bell = self.bell_gen  # 先记下门铃再查：查的过程中响了也不会漏
             r = attempt()
             if r:
                 return r, "ok"
@@ -993,7 +1181,8 @@ class Server(object):
                 self.notify("notifications/progress", {"progressToken": token, "progress": k, "message": label(int(now - start))})
                 next_tick = now + self.o.progress_interval
             with self.cond:
-                if not ctx["cancel"].is_set() and not self.stop.is_set() and self.urgent_gen == gen:
+                if (not ctx["cancel"].is_set() and not self.stop.is_set() and self.urgent_gen == gen
+                        and self.bell_gen == bell):
                     self.cond.wait(max(0.05, min(1.0, deadline - time.time(), next_tick - time.time())))
 
     def t_whoami(self, a, ctx):
@@ -1086,6 +1275,7 @@ class Server(object):
         while True:
             if ctx["cancel"].is_set() or self.stop.is_set():
                 return "已取消", {"cancelled": True}
+            bell = self.bell_gen  # 先记下门铃再查：查的过程中响了也不会漏
             d = self.collect_delivery()
             if d:
                 ctx["delivery"] = d
@@ -1099,9 +1289,13 @@ class Server(object):
                 self.notify("notifications/progress", {"progressToken": token, "progress": k,
                                                        "message": "等待来信，已等 %d 秒" % int(timeout - (deadline - now))})
                 next_tick = now + self.o.progress_interval
-            poll = 2.0 if self.watch["state"] == "监视中" else 1.0  # 监视在跑时有事件会立刻叫醒；不在跑时多查几次
+            # 有人给本方发言、发通知、投信时门铃会立刻叫醒；门铃没响时按原来的间隔兜底（监视在跑时它也会叫醒）
+            poll = 2.0 if self.watch["state"] == "监视中" else 1.0
+            due = self.letters_due
+            if due:
+                poll = min(poll, max(0.05, due - now + 0.02))  # 刚到的信一过送达门槛就交出
             with self.cond:
-                if not self.events and not ctx["cancel"].is_set() and not self.stop.is_set():
+                if not self.events and not ctx["cancel"].is_set() and not self.stop.is_set() and self.bell_gen == bell:
                     self.cond.wait(max(0.05, min(poll, deadline - time.time(), next_tick - time.time())))
 
     def settle_urgent(self, limit=2.5):
@@ -1266,9 +1460,11 @@ class Server(object):
                 raise ToolError("limit 需要 n")
             args += ["--", a["n"]]
         elif act == "policy":
-            for k in ("assistant_to_assistant", "broadcast", "inactive_send"):
+            for k in ("assistant_to_assistant", "broadcast", "inactive_send", "talk_burst"):
                 if a.get(k):
                     args.append(opt(k.replace("_", "-"), a[k]))
+            if a.get("talk_max_turns") is not None:
+                args.append(opt("talk-max-turns", a["talk_max_turns"]))
         elif act == "approve":
             for k in ("role", "box", "note"):
                 if a.get(k):
@@ -1316,7 +1512,7 @@ class Server(object):
     def talk_text(self, xs, indent="  "):
         lines = []
         for x in xs:
-            head = "%s%s #%d %s %s" % (indent, x.get("conv", ""), x["seq"], self.fmt_at(x.get("at")), x.get("from") or "?")
+            head = "%s%s #%d %s %s" % (indent, x.get("conv", ""), x["seq"], self.fmt_at(x.get("at")), x.get("from") or "系统")
             if x.get("kind", "msg") != "msg":
                 lines.append("%s · %s" % (head, x.get("text") or ""))
                 continue
@@ -1357,8 +1553,8 @@ class Server(object):
         me = {"name": self.o.me}
 
         def attempt():
-            try:
-                xs = [x for x in core.talk_replies(mb, me, cid, rec["seq"]) if x.get("kind", "msg") in ("msg", "close")]
+            try:  # 有人回话、通话结束或被暂停都不再等
+                xs = [x for x in core.talk_replies(mb, me, cid, rec["seq"]) if x.get("kind", "msg") in ("msg", "close", "pause")]
             except core.CliError:
                 return None
             return xs or None
@@ -1402,7 +1598,7 @@ class Server(object):
     def t_talk(self, a, ctx):
         act = a["action"]
         conv = a.get("conv")
-        if act in ("say", "read", "invite", "leave", "close") and not conv:
+        if act in ("say", "read", "invite", "leave", "close", "pause", "resume") and not conv:
             raise ToolError("%s 需要 conv（通话编号，如 c12）" % act)
         if act in ("start", "say"):
             if not a.get("text"):
@@ -1432,9 +1628,10 @@ class Server(object):
                     args.append(opt(k, a[k]))
             d = self.cli(*(args + ["--", conv]), as_json=True)
             b = d["conv"]
-            head = "通话 %s%s｜%s｜成员 %s｜共 %d 条，未读 %d" % (b["id"], ("「%s」" % b["topic"]) if b["topic"] else "",
-                                                       "进行中" if b["state"] == "open" else "已结束", "、".join(b["members"]),
-                                                       d["total"], d["unread"])
+            cap = int((b.get("limits") or {}).get("max_turns") or 0)
+            head = "通话 %s%s｜%s｜成员 %s｜共 %d 条，未读 %d%s" % (b["id"], ("「%s」" % b["topic"]) if b["topic"] else "",
+                                                         core.talk_state_zh(b), "、".join(b["members"]),
+                                                         d["total"], d["unread"], ("｜发言上限 %d" % cap) if cap else "")
             return "\n".join([head] + self.talk_text(d["messages"])), d
         if act == "list":
             d = self.cli(*(["talk", "list", "--json"] + (["--all"] if a.get("all") else [])
@@ -1443,7 +1640,7 @@ class Server(object):
             for r in d["conversations"]:
                 last = r.get("last") or {}
                 lines.append("  %s%s｜%s｜成员 %s｜未读 %d%s" % (
-                    r["id"], ("「%s」" % r["topic"]) if r["topic"] else "", "进行中" if r["state"] == "open" else "已结束",
+                    r["id"], ("「%s」" % r["topic"]) if r["topic"] else "", core.talk_state_zh(r),
                     "、".join(r["members"]), r["unread"],
                     ("｜最后 #%d %s：%s" % (last["seq"], last.get("from"), last.get("text"))) if last else ""))
             return "\n".join(lines), d
@@ -1479,7 +1676,16 @@ class Server(object):
         args = ["talk", act, "--json"] + ([opt("to", a["to"])] if act == "invite" and a.get("to") else [])
         if act == "invite" and not a.get("to"):
             raise ToolError("invite 需要 to")
-        d = self.cli(*(args + ["--", conv]), as_json=True)
+        if act == "resume" and a.get("max_turns") is not None:
+            args.append(opt("max-turns", a["max_turns"]))
+        tmp = self.write_temp(a["text"], ".txt") if act == "pause" and a.get("text") else None
+        try:
+            if tmp:
+                args.append(opt("file", tmp))
+            d = self.cli(*(args + ["--", conv]), as_json=True)
+        finally:
+            if tmp:
+                os.unlink(tmp)
         return "通话 %s：%s" % (d["conv"]["id"], d["record"]["text"]), d
 
     def t_notify(self, a, ctx):
@@ -1691,11 +1897,29 @@ class Server(object):
             d = self.cli(*args, as_json=True)
             lines = []
             for r in d["participants"]:
-                lines.append("%s（%s%s）预设：%s%s%s" % (
+                lines.append("%s（%s%s）预设：%s%s%s%s" % (
                     r["name"], core.ROLE_ZH.get(r["role"], r["role"]), "" if r["active"] else "，不在任",
                     "全部权限" if r["preset"] == ["*"] else ("、".join(r["preset"]) or "（无）"),
-                    "；授予：" + "、".join(r["allow"]) if r["allow"] else "", "；收回：" + "、".join(r["deny"]) if r["deny"] else ""))
+                    "；授予：" + "、".join(r["allow"]) if r["allow"] else "", "；收回：" + "、".join(r["deny"]) if r["deny"] else "",
+                    "；配额：" + "、".join("%s %s（已用 %d）" % (core.QUOTA_ZH[k], core.quota_zh(v["limit"]), v["used"])
+                                          for k, v in (r.get("quota") or {}).items()) if r.get("quota") else ""))
             return "\n".join(lines), d
+        if act == "quota":
+            if not a.get("name") or not a.get("perm") or not a.get("limit"):
+                d = self.cli("perm", "quota", "--json", *([safe_positional(a["name"], "name")] if a.get("name") else []), as_json=True)
+                lines = ["配额设置：" + ("；".join("%s %s" % (k, "、".join("%s %s" % (core.QUOTA_ZH.get(x, x), core.quota_zh(v))
+                                                                          for x, v in sorted(q.items())))
+                                                for k, q in sorted(d["quotas"].items())) or "（没有，任何人都不限次数）")]
+                lines += ["  %s 本窗口已用：%s" % (r["name"], "、".join("%s %d/%s" % (core.QUOTA_ZH[k], v["used"], core.quota_zh(v["limit"]))
+                                                                   for k, v in r["quota"].items()))
+                          for r in d["participants"] if r["quota"]]
+                lines.append("设配额要同时给 name、perm（talk、call、send、notify、queue.push）和 limit（如 60/h；none 不限；off 去掉）。")
+                return "\n".join(lines), d
+            if a["perm"] not in core.QUOTA_ACTIONS:
+                raise ToolError("quota 的 perm 只能是 %s" % "、".join(core.QUOTA_ACTIONS))
+            d = self.cli("perm", "quota", "--json", "--", a["name"], a["perm"], a["limit"], as_json=True)
+            return "已%s %s 的%s配额%s" % ("去掉" if d["limit"] == "off" else "设定", d["subject"], core.QUOTA_ZH[d["action"]],
+                                        "" if d["limit"] == "off" else "：" + core.quota_zh(d["limit"])), d
         if not a.get("name"):
             raise ToolError("%s 需要 name" % act)
         if act == "check":
@@ -1727,6 +1951,7 @@ class Server(object):
         ("mailbox://perm", "本方权限", "application/json", "角色预设、主控的授予与收回"),
         ("mailbox://doc/protocol", "信箱协议", "text/markdown", "命名、编号、信头、路由、投递算法"),
         ("mailbox://doc/roles", "角色与写信纪律", "text/markdown", "主控与助手的职责"),
+        ("mailbox://doc/mcp", "MCP 工具详解", "text/markdown", "全部工具与参数、资源与提示词、推送与送达、阻塞等待、通话上限与配额"),
     ]
 
     def m_resources_list(self, p, ctx, modern):
@@ -1957,7 +2182,31 @@ def build_parser():
     p.add_argument("--harness", default=os.environ.get("AGENT_MAILBOX_HARNESS", ""), help="本方宿主或客户端（--init、--join 时登记）")
     p.add_argument("--note", default="", help="申请加入时的附言")
     p.add_argument("--token-file", default=None, help="身份令牌文件（花名册给本方设了令牌时用；也可用环境变量 AGENT_MAILBOX_TOKEN）")
+    p.add_argument("--tools", default=os.environ.get("AGENT_MAILBOX_TOOLS", "auto"),
+                   help="工具清单：auto 按本方权限只列能用的工具和动作（默认）；all 全部列出、不随权限变；"
+                        "core 只列常用的 8 个；也可写逗号分隔的工具名（可省去 mailbox_ 前缀）")
     return p
+
+
+def tool_pick(spec):
+    """--tools 的值 → 选定的工具名集合；auto、all 返回 None（不按名字筛）。写错了抛 ValueError。"""
+    spec = (spec or "auto").strip().lower()
+    if spec in ("auto", "all"):
+        return None
+    if spec == "core":
+        return set(TOOL_CORE)
+    out = set()
+    for x in re.split(r"[,，\s]+", spec):
+        if not x:
+            continue
+        n = x if x.startswith("mailbox_") else "mailbox_" + x
+        if n not in TOOL_NAMES:
+            raise ValueError("--tools 里有不认识的工具 %r（可选：auto、all、core，或 %s）" % (
+                x, "、".join(t[len("mailbox_"):] for t in TOOL_NAMES)))
+        out.add(n)
+    if not out:
+        raise ValueError("--tools 至少要选一个工具")
+    return out
 
 
 def main(argv=None):
@@ -1965,6 +2214,12 @@ def main(argv=None):
     if not o.mailbox or not o.me:
         sys.stderr.write("agent-mailbox MCP：需要 --mailbox 和 --as（或环境变量 AGENT_MAILBOX_DIR、AGENT_MAILBOX_ME）\n")
         return 2
+    try:
+        tool_pick(o.tools)
+    except ValueError as e:
+        sys.stderr.write("agent-mailbox MCP：%s\n" % e)
+        return 2
+    o.tools = (o.tools or "auto").strip().lower() if (o.tools or "auto").strip().lower() in ("auto", "all", "core") else o.tools
     o.mailbox = os.path.abspath(os.path.expanduser(o.mailbox))
     try:
         sys.stderr.reconfigure(encoding="utf-8", errors="replace")
