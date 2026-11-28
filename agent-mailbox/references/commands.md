@@ -141,6 +141,7 @@ positional arguments:
     show                查看花名册
     add                 加入参与方（主控或用户）
     update              改参与方信息（本人可改 model/harness/session/note）
+    skills              技能：查看；本人申报（--set），主控批准（--approve）或驳回（--reject），主控也可直接设
     remove              移除助手（改为前任，历史保留）
     handover            交接主控（主控唯一）
     limit               设在任助手上限
@@ -171,7 +172,8 @@ options:
 usage: mailbox.py roster add [-h] [--mailbox MAILBOX] [--config CONFIG] [--state-dir STATE_DIR] [--as ME]
                              [--token-file TOKEN_FILE] [--read-only] [--json] [--role {assistant,observer}]
                              [--model MODEL] [--harness HARNESS] [--session SESSION] [--display DISPLAY]
-                             [--box BOX] [--alias ALIAS] [--note NOTE]
+                             [--box BOX] [--alias ALIAS] [--note NOTE] [--skills SKILLS]
+                             [--max-jobs MAX_JOBS]
                              name
 
 positional arguments:
@@ -187,6 +189,8 @@ options:
   --box BOX             收件箱（默认用名字；多方可共用一箱，靠标题点名区分）
   --alias ALIAS
   --note NOTE
+  --skills SKILLS       技能标签（逗号分隔），工作队列按它判断谁能接哪个任务
+  --max-jobs MAX_JOBS   同时最多领几个任务（默认 1，0 表示不限）
 
 通用选项:
   --mailbox, -m MAILBOX
@@ -208,7 +212,8 @@ usage: mailbox.py roster update [-h] [--mailbox MAILBOX] [--config CONFIG] [--st
                                 [--token-file TOKEN_FILE] [--read-only] [--json] [--display DISPLAY]
                                 [--model MODEL] [--harness HARNESS] [--session SESSION] [--box BOX]
                                 [--note NOTE] [--alias-add ALIAS_ADD] [--alias-remove ALIAS_REMOVE]
-                                [--activate {assistant,observer}]
+                                [--activate {assistant,observer}] [--skills SKILLS] [--max-jobs MAX_JOBS]
+                                [--auto-take AUTO_TAKE]
                                 name
 
 positional arguments:
@@ -226,6 +231,41 @@ options:
   --alias-remove ALIAS_REMOVE
   --activate {assistant,observer}
                         让前任重新在任
+  --skills SKILLS       直接设技能标签（主控、用户或 roster.admin；本人申报用 roster skills）
+  --max-jobs MAX_JOBS   同时最多领几个任务（0 表示不限；主控、用户或 roster.admin）
+  --auto-take AUTO_TAKE
+                        空闲时自动接哪些队列的任务（逗号分隔，* 表示全部，off 关闭；本人可改）
+
+通用选项:
+  --mailbox, -m MAILBOX
+                        信箱目录（默认取环境变量 AGENT_MAILBOX_DIR，再取 ~/.agent-mailbox/default.json）
+  --config CONFIG       花名册文件（默认 <信箱>/.agent-mailbox/config.json）
+  --state-dir STATE_DIR
+                        控制目录（默认 <信箱>/.agent-mailbox）
+  --as ME               本方参与方名（默认环境变量 AGENT_MAILBOX_ME）
+  --token-file TOKEN_FILE
+                        身份令牌文件（花名册给本方设了令牌时用；也可用环境变量 AGENT_MAILBOX_TOKEN）
+  --read-only           只读：不写游标、锁、在线状态，拒绝投递
+  --json                输出 JSON
+```
+
+## roster skills：技能申报与批准
+
+```text
+usage: mailbox.py roster skills [-h] [--mailbox MAILBOX] [--config CONFIG] [--state-dir STATE_DIR] [--as ME]
+                                [--token-file TOKEN_FILE] [--read-only] [--json] [--set SET] [--approve]
+                                [--reject] [--reason REASON]
+                                [name]
+
+positional arguments:
+  name
+
+options:
+  -h, --help            show this help message and exit
+  --set SET             技能标签（逗号分隔；空串表示清空）
+  --approve             批准待批的申报
+  --reject              驳回待批的申报
+  --reason REASON       驳回理由
 
 通用选项:
   --mailbox, -m MAILBOX
@@ -332,6 +372,7 @@ usage: mailbox.py roster policy [-h] [--mailbox MAILBOX] [--config CONFIG] [--st
                                 [--assistant-to-assistant {allow,cc-controller,deny}]
                                 [--broadcast {controller,anyone}] [--inactive-send {deny,allow}]
                                 [--talk-max-turns TALK_MAX_TURNS] [--talk-burst TALK_BURST]
+                                [--max-jobs MAX_JOBS]
 
 options:
   -h, --help            show this help message and exit
@@ -342,6 +383,7 @@ options:
                         新建通话最多几条发言，到了自动暂停（0 表示不限；默认 40）
   --talk-burst TALK_BURST
                         新建通话里两方快速来回到「条数/秒数」就自动暂停，如 20/300；off 关闭（默认 20/300）
+  --max-jobs MAX_JOBS   每人同时最多领几个任务（默认 1，0 表示不限；本人设了 max_jobs 的以本人为准）
 
 通用选项:
   --mailbox, -m MAILBOX
@@ -385,7 +427,7 @@ options:
 usage: mailbox.py roster approve [-h] [--mailbox MAILBOX] [--config CONFIG] [--state-dir STATE_DIR]
                                  [--as ME] [--token-file TOKEN_FILE] [--read-only] [--json]
                                  [--role {assistant,observer}] [--box BOX] [--allow ALLOW] [--deny DENY]
-                                 [--note NOTE]
+                                 [--note NOTE] [--skills SKILLS]
                                  name
 
 positional arguments:
@@ -399,6 +441,7 @@ options:
   --allow ALLOW         额外授予的权限（可逗号分隔）
   --deny DENY           收回的权限（可逗号分隔）
   --note NOTE
+  --skills SKILLS       批准时确认或改写申报的技能（逗号分隔；默认照申请）
 
 通用选项:
   --mailbox, -m MAILBOX
@@ -1553,12 +1596,16 @@ positional arguments:
     list                全部队列与各状态任务数
     create              建队列或改设置（queue.admin）
     push                投任务（queue.push；队列不存在时有 queue.admin 会自动建）
-    take                领下一个任务（queue.take）；--wait 时排队等
+    take                领一个任务（queue.take）：默认领你能领的里面排最前的；--wait 时排队等
     done                完成（--text 写结果）
     fail                记为失败（--retry 还有次数就放回重试）
     release             做不了，放回排队（不算一次尝试）
     renew               续租
     cancel              取消（投放者或 queue.admin）
+    decline             不适合我：放回排队（不算一次尝试），以后不再分给我；没领的也可以先拒绝
+    progress            报进度（--pct、--text），顺带续租；投放者收到通知（同一任务 5 分钟内最多一次）
+    block               卡住了：写明卡在哪，通知主控与投放者，租约暂停
+    unblock             解除卡住（领取方、投放者或 queue.admin），租约重新计时
     show                队列里的任务
     job                 一个任务的详情（内容、结果、经过）
     wait                等任务结束，打印结果
@@ -1642,7 +1689,8 @@ options:
 ```text
 usage: mailbox.py queue push [-h] [--mailbox MAILBOX] [--config CONFIG] [--state-dir STATE_DIR] [--as ME]
                              [--token-file TOKEN_FILE] [--read-only] [--json] --title TITLE [--text TEXT |
-                             --file FILE] [--allow-secret] [--priority PRIORITY] [--to TO] [--wait WAIT]
+                             --file FILE] [--allow-secret] [--priority PRIORITY] [--to TO] [--needs NEEDS]
+                             [--prefers PREFERS] [--wait WAIT]
                              name
 
 positional arguments:
@@ -1656,6 +1704,8 @@ options:
   --allow-secret        确认不是凭据时放行疑似凭据
   --priority PRIORITY   越大越先领
   --to TO               指派给某人（只有他能领）
+  --needs NEEDS         所需技能（逗号分隔）：只有全部具备的人能领
+  --prefers PREFERS     加分技能（逗号分隔）：同优先级里具备得多的人先领到
   --wait WAIT           等任务结束的秒数
 
 通用选项:
@@ -1675,7 +1725,7 @@ options:
 
 ```text
 usage: mailbox.py queue take [-h] [--mailbox MAILBOX] [--config CONFIG] [--state-dir STATE_DIR] [--as ME]
-                             [--token-file TOKEN_FILE] [--read-only] [--json] [--wait WAIT]
+                             [--token-file TOKEN_FILE] [--read-only] [--json] [--job JOB] [--wait WAIT]
                              name
 
 positional arguments:
@@ -1683,7 +1733,40 @@ positional arguments:
 
 options:
   -h, --help            show this help message and exit
+  --job JOB             领指定的这一个
   --wait WAIT
+
+通用选项:
+  --mailbox, -m MAILBOX
+                        信箱目录（默认取环境变量 AGENT_MAILBOX_DIR，再取 ~/.agent-mailbox/default.json）
+  --config CONFIG       花名册文件（默认 <信箱>/.agent-mailbox/config.json）
+  --state-dir STATE_DIR
+                        控制目录（默认 <信箱>/.agent-mailbox）
+  --as ME               本方参与方名（默认环境变量 AGENT_MAILBOX_ME）
+  --token-file TOKEN_FILE
+                        身份令牌文件（花名册给本方设了令牌时用；也可用环境变量 AGENT_MAILBOX_TOKEN）
+  --read-only           只读：不写游标、锁、在线状态，拒绝投递
+  --json                输出 JSON
+```
+
+## queue progress：报进度
+
+```text
+usage: mailbox.py queue progress [-h] [--mailbox MAILBOX] [--config CONFIG] [--state-dir STATE_DIR]
+                                 [--as ME] [--token-file TOKEN_FILE] [--read-only] [--json] [--text TEXT |
+                                 --file FILE] [--allow-secret] [--pct PCT]
+                                 name job
+
+positional arguments:
+  name
+  job
+
+options:
+  -h, --help            show this help message and exit
+  --text TEXT           进度说明
+  --file FILE           从文件读进度说明（长内容用它，免得 shell 转义）
+  --allow-secret        确认不是凭据时放行疑似凭据
+  --pct PCT             完成百分比 0–100
 
 通用选项:
   --mailbox, -m MAILBOX
@@ -1714,6 +1797,99 @@ options:
   -h, --help            show this help message and exit
   --text TEXT           结果
   --file FILE           从文件读结果（长内容用它，免得 shell 转义）
+  --allow-secret        确认不是凭据时放行疑似凭据
+
+通用选项:
+  --mailbox, -m MAILBOX
+                        信箱目录（默认取环境变量 AGENT_MAILBOX_DIR，再取 ~/.agent-mailbox/default.json）
+  --config CONFIG       花名册文件（默认 <信箱>/.agent-mailbox/config.json）
+  --state-dir STATE_DIR
+                        控制目录（默认 <信箱>/.agent-mailbox）
+  --as ME               本方参与方名（默认环境变量 AGENT_MAILBOX_ME）
+  --token-file TOKEN_FILE
+                        身份令牌文件（花名册给本方设了令牌时用；也可用环境变量 AGENT_MAILBOX_TOKEN）
+  --read-only           只读：不写游标、锁、在线状态，拒绝投递
+  --json                输出 JSON
+```
+
+## queue block：卡住
+
+```text
+usage: mailbox.py queue block [-h] [--mailbox MAILBOX] [--config CONFIG] [--state-dir STATE_DIR] [--as ME]
+                              [--token-file TOKEN_FILE] [--read-only] [--json] [--text TEXT | --file FILE]
+                              [--allow-secret]
+                              name job
+
+positional arguments:
+  name
+  job
+
+options:
+  -h, --help            show this help message and exit
+  --text TEXT           卡住的原因
+  --file FILE           从文件读卡住的原因（长内容用它，免得 shell 转义）
+  --allow-secret        确认不是凭据时放行疑似凭据
+
+通用选项:
+  --mailbox, -m MAILBOX
+                        信箱目录（默认取环境变量 AGENT_MAILBOX_DIR，再取 ~/.agent-mailbox/default.json）
+  --config CONFIG       花名册文件（默认 <信箱>/.agent-mailbox/config.json）
+  --state-dir STATE_DIR
+                        控制目录（默认 <信箱>/.agent-mailbox）
+  --as ME               本方参与方名（默认环境变量 AGENT_MAILBOX_ME）
+  --token-file TOKEN_FILE
+                        身份令牌文件（花名册给本方设了令牌时用；也可用环境变量 AGENT_MAILBOX_TOKEN）
+  --read-only           只读：不写游标、锁、在线状态，拒绝投递
+  --json                输出 JSON
+```
+
+## queue unblock：解除卡住
+
+```text
+usage: mailbox.py queue unblock [-h] [--mailbox MAILBOX] [--config CONFIG] [--state-dir STATE_DIR] [--as ME]
+                                [--token-file TOKEN_FILE] [--read-only] [--json] [--text TEXT | --file FILE]
+                                [--allow-secret]
+                                name job
+
+positional arguments:
+  name
+  job
+
+options:
+  -h, --help            show this help message and exit
+  --text TEXT           答复
+  --file FILE           从文件读答复（长内容用它，免得 shell 转义）
+  --allow-secret        确认不是凭据时放行疑似凭据
+
+通用选项:
+  --mailbox, -m MAILBOX
+                        信箱目录（默认取环境变量 AGENT_MAILBOX_DIR，再取 ~/.agent-mailbox/default.json）
+  --config CONFIG       花名册文件（默认 <信箱>/.agent-mailbox/config.json）
+  --state-dir STATE_DIR
+                        控制目录（默认 <信箱>/.agent-mailbox）
+  --as ME               本方参与方名（默认环境变量 AGENT_MAILBOX_ME）
+  --token-file TOKEN_FILE
+                        身份令牌文件（花名册给本方设了令牌时用；也可用环境变量 AGENT_MAILBOX_TOKEN）
+  --read-only           只读：不写游标、锁、在线状态，拒绝投递
+  --json                输出 JSON
+```
+
+## queue decline：拒绝
+
+```text
+usage: mailbox.py queue decline [-h] [--mailbox MAILBOX] [--config CONFIG] [--state-dir STATE_DIR] [--as ME]
+                                [--token-file TOKEN_FILE] [--read-only] [--json] [--text TEXT | --file FILE]
+                                [--allow-secret]
+                                name job
+
+positional arguments:
+  name
+  job
+
+options:
+  -h, --help            show this help message and exit
+  --text TEXT           拒绝的原因
+  --file FILE           从文件读拒绝的原因（长内容用它，免得 shell 转义）
   --allow-secret        确认不是凭据时放行疑似凭据
 
 通用选项:
@@ -1941,8 +2117,8 @@ options:
 ```text
 usage: mailbox.py join [-h] [--mailbox MAILBOX] [--config CONFIG] [--state-dir STATE_DIR] [--as ME]
                        [--token-file TOKEN_FILE] [--read-only] [--json] [--model MODEL] [--harness HARNESS]
-                       [--display DISPLAY] [--note NOTE] [--role {assistant,observer}] [--wait WAIT]
-                       [--status]
+                       [--display DISPLAY] [--note NOTE] [--skills SKILLS] [--role {assistant,observer}]
+                       [--wait WAIT] [--status]
 
 申请加入信箱（--as 写想用的名字），排队等主控批准
 
@@ -1952,6 +2128,7 @@ options:
   --harness HARNESS
   --display DISPLAY
   --note NOTE           附言：你是谁、能做什么
+  --skills SKILLS       申报技能标签（逗号分隔），主控批准时确认
   --role {assistant,observer}
   --wait WAIT           等批准的秒数
   --status              只查申请状态

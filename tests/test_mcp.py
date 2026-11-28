@@ -755,7 +755,8 @@ class McpSpeedAndGuardTest(McpBase):
         self.assertIn("quota", actions_of(tb["mailbox_perm"]))
         self.assertEqual(actions_of(ta["mailbox_perm"]), ["list", "show", "check"])
         self.assertNotIn("limit", ta["mailbox_perm"]["inputSchema"]["properties"])
-        self.assertEqual(actions_of(ta["mailbox_roster"]), ["show", "update"])
+        self.assertEqual(actions_of(ta["mailbox_roster"]), ["show", "update", "skills"])  # 助手能申报自己的技能
+        self.assertNotIn("verdict", ta["mailbox_roster"]["inputSchema"]["properties"])  # 批准申报是主控的事
         self.assertNotIn("display", ta["mailbox_roster"]["inputSchema"]["properties"])
         self.assertIn("pause", actions_of(tb["mailbox_talk"]))
         self.assertNotIn("pause", actions_of(ta["mailbox_talk"]))
@@ -841,6 +842,80 @@ class McpSpeedAndGuardTest(McpBase):
         self.assertIn("发通知", text_of(a.call("mailbox_perm", {"action": "show"})))
         r = boss.call("mailbox_perm", {"action": "quota"})
         self.assertIn("helper-a", text_of(r))
+
+
+
+class McpQueueClaimTest(McpBase):
+    """任务领取经 MCP：空闲自动接单、并发上限、拒绝、进度、技能申报与批准。"""
+
+    def test_auto_take_when_idle(self):
+        cli(self.mb, "roster", "skills", "helper-a", "--as", "boss", "--set", "python")
+        cli(self.mb, "roster", "update", "helper-a", "--as", "helper-a", "--auto-take", "work")
+        cli(self.mb, "queue", "create", "work", "--as", "boss")
+        boss, a = self.client("boss"), self.client("helper-a")
+        boss.init()
+        a.init()
+        self.assertIn("技能", text_of(a.call("mailbox_wait", {"timeout_seconds": 5}, timeout=30)))  # 先取走「技能变更」的通知
+        got = {}
+        th = threading.Thread(target=lambda: got.update(w=a.call("mailbox_wait", {"timeout_seconds": 30}, timeout=60)))
+        th.start()
+        time.sleep(0.5)
+        r = boss.call("mailbox_queue", {"action": "push", "queue": "work", "title": "跑测试", "needs": ["python"]})
+        self.assertIn("能接的人：helper-a", text_of(r))
+        th.join(40)
+        w = got["w"]
+        self.assertIn("【自动接单】", text_of(w))
+        self.assertEqual((w["structuredContent"]["auto_taken"]["id"], w["structuredContent"]["auto_taken"]["claimed_by"]), (1, "helper-a"))
+        # 手上满了（默认 1 个）就不再自动接：新任务只作为通知送到
+        boss.call("mailbox_queue", {"action": "push", "queue": "work", "title": "第二个", "needs": ["python"]})
+        w = a.call("mailbox_wait", {"timeout_seconds": 10}, timeout=30)
+        self.assertNotIn("auto_taken", w["structuredContent"])
+        self.assertIn("第二个", text_of(w))
+        r = a.call("mailbox_queue", {"action": "progress", "queue": "work", "job": 1, "pct": 80, "text": "快好了"})
+        self.assertFalse(r.get("isError"), text_of(r))
+        self.assertFalse(a.call("mailbox_queue", {"action": "done", "queue": "work", "job": 1, "text": "全绿"}).get("isError"))
+        w = a.call("mailbox_wait", {"timeout_seconds": 10}, timeout=30)  # 交完就接下一个
+        self.assertEqual(w["structuredContent"]["auto_taken"]["id"], 2)
+        # 拒绝后不会再被自动接到
+        r = a.call("mailbox_queue", {"action": "decline", "queue": "work", "job": 2, "text": "环境不对"})
+        self.assertFalse(r.get("isError"), text_of(r))
+        w = a.call("mailbox_wait", {"timeout_seconds": 2}, timeout=30)
+        self.assertNotIn("auto_taken", w["structuredContent"])
+        j = boss.call("mailbox_queue", {"action": "job", "queue": "work", "job": 2})["structuredContent"]
+        self.assertEqual((j["status"], [d["who"] for d in j["declined"]]), ("pending", ["helper-a"]))
+
+    def test_skills_and_claim_over_mcp(self):
+        boss, a = self.client("boss"), self.client("helper-a", "--no-watch")
+        boss.init()
+        a.init()
+        r = a.call("mailbox_roster", {"action": "skills", "name": "helper-a", "skills": ["python", "docs"]})
+        self.assertIn("等主控批准", text_of(r))
+        r = boss.call("mailbox_roster", {"action": "skills", "name": "helper-a", "verdict": "approve"})
+        self.assertFalse(r.get("isError"), text_of(r))
+        self.assertEqual(a.call("mailbox_whoami")["structuredContent"]["identity"]["skills"], ["python", "docs"])
+        boss.call("mailbox_queue", {"action": "create", "queue": "work"})
+        boss.call("mailbox_queue", {"action": "push", "queue": "work", "title": "前端", "needs": ["frontend"]})
+        boss.call("mailbox_queue", {"action": "push", "queue": "work", "title": "写文档", "needs": ["python"], "prefers": ["docs"]})
+        r = a.call("mailbox_queue", {"action": "take", "queue": "work", "job": 1})
+        self.assertTrue(r.get("isError"))
+        self.assertIn("缺技能 frontend", text_of(r))
+        r = a.call("mailbox_queue", {"action": "take", "queue": "work"})
+        self.assertEqual(r["structuredContent"]["id"], 2)
+        r = a.call("mailbox_queue", {"action": "block", "queue": "work", "job": 2, "text": "缺样例"})
+        self.assertIn("卡住", text_of(r))
+        r = boss.call("mailbox_queue", {"action": "unblock", "queue": "work", "job": 2, "text": "样例在 docs/x"})
+        self.assertFalse(r.get("isError"), text_of(r))
+        boss.call("mailbox_queue", {"action": "push", "queue": "work", "title": "再一个", "needs": ["python"]})
+        r = a.call("mailbox_queue", {"action": "take", "queue": "work"})  # 手上已有一个
+        self.assertTrue(r["structuredContent"].get("empty"))
+        self.assertEqual(r["structuredContent"]["why"], {"手上已满": 1, "缺技能": 1})
+        self.assertIn("手上已满", text_of(r))
+        for act in ("decline", "progress", "block", "unblock"):  # 这些动作都要给任务号
+            r = a.call("mailbox_queue", {"action": act, "queue": "work", "text": "x"})
+            self.assertTrue(r.get("isError"))
+            self.assertIn("需要 job", text_of(r))
+        r = a.call("mailbox_roster", {"action": "skills", "name": "helper-a"})
+        self.assertIn("同时最多领 1 个", text_of(r))
 
 
 if __name__ == "__main__":

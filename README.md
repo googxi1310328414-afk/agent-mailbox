@@ -16,7 +16,9 @@
   - 只有回应确实发出才记为已送达；服务重启也不丢。
 - **队列等待**：
   - **来电队列**：别人打来的通话按「紧急优先、先来后到」排队，`mailbox_talk next` 逐个接；呼叫方能看到自己排在第几位。
-  - **工作队列**：`mailbox_queue` 投任务，可设优先级、指派给某人。领取方用 `take` 排队等活；投放方用 `wait` 等结果。
+  - **工作队列**：`mailbox_queue` 投任务，可设优先级、所需技能，或指派给某人。领取方用 `take` 排队等活；投放方用 `wait` 等结果。
+  - **按技能分派**：不必指定人，系统只把任务分给具备所需技能、手上有空的人，也只通知这些人；没人能接时告诉主控。技能由助手申报、主控批准。
+  - **自动接单**：开启后，模型空闲等待时由服务直接领好最合适的任务交给它。做的过程中可以报进度、标记卡住（主控收到通知），不适合就拒绝，以后不再分给他。
   - 领到的任务有租约，到期没完成就放回排队，用完尝试次数就判失败并通知投放者。几个模型同时领，也绝不会领到同一个。
   - 申请加入的新模型也在队列里等主控批准。
 - **多模型自由通话**：
@@ -93,17 +95,17 @@ agent-mailbox --mailbox /path/to/mailbox --as lead perm quota @assistants call 2
 - **信件**：`mailbox_send`、`mailbox_inbox`、`mailbox_read`、`mailbox_mark`、`mailbox_search`。
 - **通话**：`mailbox_call`（呼叫并等回复）、`mailbox_talk`（发起、发言、读、来电队列、接下一个、邀请、退出、结束；主控暂停、继续）。
 - **通知**：`mailbox_notify`。
-- **队列**：`mailbox_queue`（建、投、领、完成、失败、放回、续租、取消、查看、等结果）。
+- **队列**：`mailbox_queue`（建、投、领、报进度、卡住与解除、拒绝、完成、失败、放回、续租、取消、查看、等结果）。
 - **权限**：`mailbox_perm`（目录、查看、判定、授予、收回、重置、角色预设、配额）。
 - **等待**：`mailbox_wait`。
-- **身份与花名册**：`mailbox_whoami`、`mailbox_roster`（含加入申请的审批）、`mailbox_who`。
+- **身份与花名册**：`mailbox_whoami`、`mailbox_roster`（含加入申请的审批、技能申报与批准）、`mailbox_who`。
 - **续接**：`mailbox_tasks`、`mailbox_notes`、`mailbox_status_board`。
 - **其它**：`mailbox_doctor`、`mailbox_template`。
 
 另有资源（`mailbox://inbox`、`mailbox://notifications`、`mailbox://talk` 可订阅；`mailbox://doc/mcp` 是工具的详细用法）和 10 个信件模板提示词。
 
 工具清单按身份裁剪：只列本方权限够得着的工具、动作和参数，权限变了推送 `tools/list_changed`，省下每个模型的上下文。
-- 实测（粗估）：助手约 4000 tokens，旁听者约 2900；1.2 时每人约 5400。
+- 实测（粗估）：助手约 4300 tokens，旁听者约 3100；1.2 时每人约 5400。
 - 只做通话的模型可以用 `--tools core`（8 个常用工具，约 1900）；需要固定清单时用 `--tools all`。
 
 ## 文档

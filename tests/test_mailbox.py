@@ -1069,6 +1069,7 @@ class QueueTest(unittest.TestCase):
 
     def test_priority_assignment_and_lifecycle(self):
         b = self.b
+        b.run("roster", "policy", "--as", "boss", "--max-jobs", "0")  # 本测试看领取顺序与处置：一人可同时领多个
         self.assertNotEqual(b.run("queue", "push", "review", "--as", "helper-a", "--title", "x")[0], 0)  # 助手不能建队列
         self.assertEqual(b.run("queue", "create", "review", "--as", "boss", "--desc", "代码评审")[0], 0)
         for args in (["--title", "低优先"], ["--title", "高优先", "--priority", "5"], ["--title", "指派给 b", "--to", "helper-b"]):
@@ -1159,6 +1160,7 @@ class QueueTest(unittest.TestCase):
 
     def test_concurrent_takes_never_double_claim(self):
         b = self.b
+        b.run("roster", "policy", "--as", "boss", "--max-jobs", "0")  # 本测试看并发安全：一人可同时领多个
         b.run("queue", "create", "pool", "--as", "boss")
         for i in range(6):
             b.run("queue", "push", "pool", "--as", "boss", "--title", "活 %d" % i)
@@ -1577,6 +1579,157 @@ class QuotaTest(unittest.TestCase):
         no("talk", "say", "c1", "--as", "helper-a", "--text", "3")
         ok("talk", "say", "c1", "--as", "helper-c", "--text", "别人不受影响")
         ok("send", "--as", "boss", "--to", "helper-a", "--subject", "主控不限", "--body", "x")
+
+
+class QueueClaimTest(unittest.TestCase):
+    """任务领取：技能申报与批准、按技能筛选与排序、指定领取、并发上限、拒绝、进度、卡住。"""
+
+    def setUp(self):
+        self.b = Box()
+
+    def tearDown(self):
+        self.b.close()
+
+    def notes(self, who, kind):
+        return [x for x in self.b.jrun("notify", "list", "--as", who, "--all")["items"] if x["kind"] == kind]
+
+    def test_skills_declared_then_approved(self):
+        b = self.b
+        self.assertEqual(b.run("join", "--as", "glm", "--model", "glm-4.6", "--skills", "Python,frontend")[0], 0)
+        self.assertEqual(b.jrun("roster", "requests", "--as", "boss")["requests"][0]["skills"], ["python", "frontend"])
+        self.assertTrue([x for x in self.notes("boss", "join") if "申报技能" in x["text"]])
+        self.assertEqual(b.run("roster", "approve", "glm", "--as", "boss", "--skills", "python,review")[0], 0)  # 批准时改写
+        self.assertEqual(b.jrun("roster", "skills", "glm")["participants"][0]["skills"], ["python", "review"])
+        # 已在任的人申报 → 主控批准；本人不能直接改，也不能替别人申报
+        self.assertNotEqual(b.run("roster", "update", "helper-a", "--as", "helper-a", "--skills", "go")[0], 0)
+        self.assertNotEqual(b.run("roster", "skills", "helper-b", "--as", "helper-a", "--set", "go")[0], 0)
+        self.assertNotEqual(b.run("roster", "skills", "helper-a", "--as", "helper-a", "--set", "Bad Tag!")[0], 0)
+        self.assertEqual(b.run("roster", "skills", "helper-a", "--as", "helper-a", "--set", "go,docs")[0], 0)
+        row = b.jrun("roster", "skills", "helper-a")["participants"][0]
+        self.assertEqual((row["skills"], row["proposed"]), ([], ["go", "docs"]))
+        self.assertTrue(self.notes("boss", "skills"))
+        self.assertNotEqual(b.run("roster", "skills", "helper-a", "--as", "helper-b", "--approve")[0], 0)  # 助手不能批
+        self.assertEqual(b.run("roster", "skills", "helper-a", "--as", "boss", "--approve")[0], 0)
+        row = b.jrun("roster", "skills", "helper-a")["participants"][0]
+        self.assertEqual((row["skills"], row["proposed"]), (["go", "docs"], None))
+        self.assertTrue([x for x in self.notes("helper-a", "skills") if "批准" in x["text"]])
+        b.run("roster", "skills", "helper-a", "--as", "helper-a", "--set", "rust")
+        self.assertEqual(b.run("roster", "skills", "helper-a", "--as", "boss", "--reject", "--reason", "没见过")[0], 0)
+        self.assertEqual(b.jrun("roster", "skills", "helper-a")["participants"][0]["skills"], ["go", "docs"])
+        self.assertNotEqual(b.run("roster", "skills", "helper-a", "--as", "boss", "--approve")[0], 0)  # 没有待批的了
+        self.assertEqual(b.run("roster", "skills", "helper-c", "--as", "boss", "--set", "frontend")[0], 0)  # 主控直接设
+        self.assertEqual(b.jrun("roster", "skills", "helper-c")["participants"][0]["skills"], ["frontend"])
+
+    def setup_skills(self):
+        b = self.b
+        for who, sk in (("helper-a", "python,review,docs"), ("helper-b", "python"), ("helper-c", "frontend")):
+            self.assertEqual(b.run("roster", "skills", who, "--as", "boss", "--set", sk)[0], 0)
+        b.run("queue", "create", "work", "--as", "boss")
+
+    def test_filter_rank_take_specific_and_reasons(self):
+        b = self.b
+        self.setup_skills()
+        r = b.jrun("queue", "push", "work", "--as", "boss", "--title", "前端", "--needs", "frontend")
+        self.assertEqual(r["takers"], ["helper-c"])
+        self.assertTrue([x for x in self.notes("helper-c", "job") if "前端" in x["text"]])
+        self.assertFalse(self.notes("helper-a", "job"))  # 只通知能接的人
+        c, o, e = b.run("queue", "take", "work", "--as", "helper-a", "--job", "1")
+        self.assertEqual(c, 2)
+        self.assertIn("缺技能 frontend", e)
+        b.jrun("queue", "push", "work", "--as", "boss", "--title", "审", "--needs", "review")
+        b.jrun("queue", "push", "work", "--as", "boss", "--title", "审文档", "--needs", "review", "--prefers", "docs")
+        self.assertEqual(b.jrun("queue", "take", "work", "--as", "helper-a")["title"], "审文档")  # 加分技能先
+        c, o, e = b.run("queue", "take", "work", "--as", "helper-b", "--json")
+        self.assertEqual(c, 3)
+        self.assertEqual(json.loads(o)["why"], {"缺技能": 2})
+        self.assertEqual(b.jrun("queue", "take", "work", "--as", "helper-c", "--job", "1")["title"], "前端")
+        # 指派给缺技能的人：投的时候就拒绝
+        self.assertNotEqual(b.run("queue", "push", "work", "--as", "boss", "--title", "x", "--needs", "frontend", "--to", "helper-b")[0], 0)
+        r = b.jrun("queue", "push", "work", "--as", "boss", "--title", "rust", "--needs", "rust")
+        self.assertEqual(r["takers"], [])
+        self.assertTrue(self.notes("helper-a", "job-unclaimed") == [])
+        # 主控自己投、没人能接：投放结果里就写明了（主控不给自己发通知）
+        self.assertIn("暂时没人能接", b.run("queue", "push", "work", "--as", "boss", "--title", "rust2", "--needs", "rust")[1])
+
+    def test_concurrency_limit_policy_and_person(self):
+        b = self.b
+        self.setup_skills()
+        for i in range(3):
+            b.run("queue", "push", "work", "--as", "boss", "--title", "活 %d" % i, "--needs", "python")
+        self.assertEqual(b.run("queue", "take", "work", "--as", "helper-a")[0], 0)
+        c, o, e = b.run("queue", "take", "work", "--as", "helper-a", "--json")
+        self.assertEqual((c, json.loads(o)["why"]), (3, {"手上已满": 2}))  # 默认同时只领一个
+        self.assertNotEqual(b.run("roster", "update", "helper-a", "--as", "helper-a", "--max-jobs", "3")[0], 0)  # 本人不能改
+        self.assertEqual(b.run("roster", "update", "helper-a", "--as", "boss", "--max-jobs", "2")[0], 0)
+        self.assertEqual(b.run("queue", "take", "work", "--as", "helper-a")[0], 0)
+        self.assertEqual(b.run("queue", "take", "work", "--as", "helper-a")[0], 3)
+        self.assertEqual(b.run("queue", "take", "work", "--as", "helper-b")[0], 0)
+        b.run("queue", "push", "work", "--as", "boss", "--title", "再来", "--needs", "python")
+        self.assertEqual(b.run("queue", "take", "work", "--as", "helper-b")[0], 3)
+        self.assertEqual(b.run("roster", "policy", "--as", "boss", "--max-jobs", "0")[0], 0)  # 策略改为不限
+        self.assertEqual(b.run("queue", "take", "work", "--as", "helper-b")[0], 0)
+        self.assertNotEqual(b.run("roster", "policy", "--as", "boss", "--max-jobs", "-1")[0], 0)
+
+    def test_progress_block_unblock_decline(self):
+        b = self.b
+        self.setup_skills()
+        b.run("queue", "push", "work", "--as", "boss", "--title", "长活", "--needs", "python")
+        j = b.jrun("queue", "take", "work", "--as", "helper-a")
+        lease0 = j["lease_until"]
+        time.sleep(1.1)
+        self.assertEqual(b.run("queue", "progress", "work", "1", "--as", "helper-a", "--pct", "30", "--text", "三成")[0], 0)
+        b.run("queue", "progress", "work", "1", "--as", "helper-a", "--pct", "40")
+        self.assertEqual(len(self.notes("boss", "job-progress")), 1)  # 5 分钟内只通知一次
+        j = b.jrun("queue", "job", "work", "1")
+        self.assertEqual((j["progress"]["pct"], j["progress"]["text"]), (40, "三成"))
+        self.assertGreater(j["lease_until"], lease0)  # 报进度顺带续租
+        self.assertNotEqual(b.run("queue", "progress", "work", "1", "--as", "helper-b", "--pct", "50")[0], 0)  # 不是领取方
+        self.assertNotEqual(b.run("queue", "progress", "work", "1", "--as", "helper-a", "--pct", "101")[0], 0)
+        self.assertNotEqual(b.run("queue", "block", "work", "1", "--as", "helper-a")[0], 0)  # 要写原因
+        self.assertEqual(b.run("queue", "block", "work", "1", "--as", "helper-a", "--text", "缺测试账号")[0], 0)
+        j = b.jrun("queue", "job", "work", "1")
+        self.assertEqual((j["status"], j["lease_until"], j["blocked"]["reason"]), ("blocked", "", "缺测试账号"))
+        self.assertTrue(self.notes("boss", "job-blocked"))
+        self.assertNotEqual(b.run("queue", "progress", "work", "1", "--as", "helper-a", "--pct", "50")[0], 0)
+        self.assertNotEqual(b.run("queue", "unblock", "work", "1", "--as", "helper-b")[0], 0)
+        self.assertEqual(b.run("queue", "unblock", "work", "1", "--as", "boss", "--text", "账号 test")[0], 0)
+        j = b.jrun("queue", "job", "work", "1")
+        self.assertEqual(j["status"], "claimed")
+        self.assertTrue(j["lease_until"])
+        self.assertTrue([x for x in self.notes("helper-a", "job") if "账号 test" in x["text"]])
+        b.run("queue", "block", "work", "1", "--as", "helper-a", "--text", "又卡了")
+        self.assertEqual(b.run("queue", "done", "work", "1", "--as", "helper-a", "--text", "绕过去了")[0], 0)  # 卡住也能交付
+        self.assertEqual(b.jrun("queue", "job", "work", "1")["status"], "done")
+        # 拒绝：放回排队、不算尝试、以后不再分给他；能接的人都拒绝了就通知主控
+        b.run("queue", "push", "work", "--as", "boss", "--title", "只有 a 能做", "--needs", "docs")
+        b.jrun("queue", "take", "work", "--as", "helper-a")
+        self.assertEqual(b.run("queue", "decline", "work", "2", "--as", "helper-a", "--text", "做不了")[0], 0)
+        j = b.jrun("queue", "job", "work", "2")
+        self.assertEqual((j["status"], j["attempts"], [d["who"] for d in j["declined"]]), ("pending", 0, ["helper-a"]))
+        self.assertIn("拒绝过", b.run("queue", "take", "work", "--as", "helper-a", "--job", "2")[2])
+        self.assertTrue([x for x in self.notes("boss", "job-unclaimed") if "#2" in x["text"]])
+        self.assertNotEqual(b.run("queue", "decline", "work", "2", "--as", "helper-a")[0], 0)  # 已经拒绝过
+        b.run("queue", "push", "work", "--as", "boss", "--title", "py", "--needs", "python")
+        self.assertEqual(b.run("queue", "decline", "work", "3", "--as", "helper-b", "--text", "不想做")[0], 0)  # 没领也能先拒绝
+        self.assertEqual(b.jrun("queue", "take", "work", "--as", "helper-a")["id"], 3)
+        self.assertEqual(b.run("queue", "take", "work", "--as", "helper-b")[0], 3)
+        # 指派给别人的任务不用拒绝；没有领取权限的人拒绝不了
+        b.run("queue", "push", "work", "--as", "boss", "--title", "给 a", "--to", "helper-a")
+        c, _, e = b.run("queue", "decline", "work", "4", "--as", "helper-b")
+        self.assertNotEqual(c, 0)
+        self.assertIn("指派给了 helper-a", e)
+        b.run("perm", "revoke", "helper-c", "queue.take", "--as", "boss")
+        self.assertNotEqual(b.run("queue", "decline", "work", "4", "--as", "helper-c")[0], 0)
+        self.assertNotIn("declined", b.jrun("queue", "job", "work", "4"))
+
+    def test_empty_take_does_not_rewrite_queue(self):
+        b = self.b
+        b.run("queue", "create", "idle", "--as", "boss")
+        path = M.queue_path(b.mailbox(), "idle")
+        before = os.stat(path).st_mtime_ns, os.path.getsize(path)
+        time.sleep(0.05)
+        self.assertEqual(b.run("queue", "take", "idle", "--as", "helper-a")[0], 3)
+        self.assertEqual((os.stat(path).st_mtime_ns, os.path.getsize(path)), before)
 
 
 if __name__ == "__main__":

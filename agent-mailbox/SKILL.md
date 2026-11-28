@@ -101,16 +101,22 @@ mailbox.py ... --as <你> talk invite c3 --to glm-1     # 邀请；talk leave �
 
 ```bash
 mailbox.py ... --as <主控> queue create review --desc "代码评审" --lease 1800   # 建队列（租约秒数、最多尝试次数、领取名单）
-mailbox.py ... --as <主控> queue push review --title "审 PR 12" --text "看 diff 与测试" --priority 5   # 投任务；--to 指派给某人
-mailbox.py ... --as <你>   queue take review --wait 300     # 领下一个任务；没有就排队等
+mailbox.py ... --as <主控> queue push review --title "审 PR 12" --text "看 diff 与测试" --needs python,review --priority 5   # 投任务，不必指定人；--to 指派给某人
+mailbox.py ... --as <你>   queue take review --wait 300     # 领你能领的里面排最前的；没有就排队等（--job 7 领指定的）
+mailbox.py ... --as <你>   queue progress review 7 --pct 40 --text "看完一半"   # 报进度，顺带续租
+mailbox.py ... --as <你>   queue block review 7 --text "缺测试账号"   # 卡住了：通知主控，租约暂停；主控 queue unblock 后继续
+mailbox.py ... --as <你>   queue decline review 7 --text "不熟前端"   # 不适合我：放回排队，以后不再分给我
 mailbox.py ... --as <你>   queue done review 7 --text "LGTM，报告在 D:/run/REVIEW.md"   # 交结果，投放者会收到通知
 mailbox.py ... --as <你>   queue renew review 7             # 做得久就续租；做不了 queue release 放回；失败 queue fail [--retry]
 mailbox.py ... --as <主控> queue wait review 7 --timeout 600   # 等任务结束拿结果；queue show / job 查看
 ```
 
-- 领取顺序：优先级高的先；同优先级里指派给你的先；其余按投放先后。指派给别人的你领不到。
+- 谁能领：具备任务要求的全部技能（`--needs`）、没拒绝过、手上在做的少于上限（默认 1 个）。领不到时会告诉你原因（缺技能、手上已满……）。
+- 领取顺序：优先级高的先；同优先级里指派给你的先；再看加分技能（`--prefers`）命中多的；其余按投放先后。
+- 新任务只通知能接的人；没人能接时主控会收到通知。
 - 领到的任务有租约（默认 900 秒），到期没完成就放回排队；用完尝试次数（默认 3 次）就判失败并通知投放者。
-- 只领自己做得了的；做不了立刻 `release`，不要占着。
+- 只领自己做得了的：不适合就 `decline` 写明原因，做不了就 `release`，不要占着；卡住了 `block` 说清缺什么。
+- 用 MCP 时可以开**自动接单**：`roster update <你> --auto-take review`（`*` 表示全部队列）。之后调 `mailbox_wait` 空闲等待时，服务直接替你领最合适的任务交给你。
 
 ## 6. 通知
 
@@ -173,9 +179,11 @@ mailbox.py ... --as <你>   roster update <你> --session 01a1xxxx --model ...  
 新模型也可以自己申请加入，排队等主控批准：
 
 ```bash
-mailbox.py ... --as glm-1 join --model glm-4.6 --note "擅长写测试" --wait 600    # 申请；MCP 里启动时加 --join 即可
-mailbox.py ... --as <主控> roster requests                                     # 待批的申请
-mailbox.py ... --as <主控> roster approve glm-1 --allow talk:lead --deny broadcast   # 批准，可顺带授权；roster reject glm-1 --reason …
+mailbox.py ... --as glm-1 join --model glm-4.6 --skills python,testing --note "擅长写测试" --wait 600    # 申请并申报技能；MCP 里启动时加 --join --skills …
+mailbox.py ... --as <主控> roster requests                                     # 待批的申请（含申报的技能）
+mailbox.py ... --as <主控> roster approve glm-1 --skills python,testing --allow talk:lead   # 批准，可确认或改写技能、顺带授权；roster reject glm-1 --reason …
+mailbox.py ... --as <你>   roster skills <你> --set python,review,docs          # 已在任的人申报技能；主控 roster skills <名> --approve 或 --reject
+mailbox.py ... --as <主控> roster update kimi-1 --max-jobs 2                    # 让某人同时最多领 2 个任务；roster policy --max-jobs 改默认
 ```
 
 ## 10. 权限：主控按人分配

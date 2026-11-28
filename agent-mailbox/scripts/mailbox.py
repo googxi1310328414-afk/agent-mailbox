@@ -517,7 +517,7 @@ def default_config(thread=""):
         "max_tries": 50,
         "pad": 3,
         "policy": {"assistant_to_assistant": "allow", "broadcast": "controller", "inactive_send": "deny",
-                   "talk_max_turns": TALK_TURNS_DEFAULT, "talk_burst": TALK_BURST_DEFAULT},
+                   "talk_max_turns": TALK_TURNS_DEFAULT, "talk_burst": TALK_BURST_DEFAULT, "max_jobs": 1},
         "secret_patterns": [],
         "participants": [],
     }
@@ -541,6 +541,12 @@ def norm_participant(p):
         elif isinstance(v, list):
             q[k] = [str(x).strip() for x in v if str(x).strip()]
         # 别的类型原样留着，交给 validate_config 报错
+    for k in ("skills", "auto_take"):
+        v = q.get(k)
+        if v is None:
+            q[k] = []
+        elif isinstance(v, list):
+            q[k] = [str(x).strip().lower() for x in v if str(x).strip()]
     return q
 
 
@@ -577,6 +583,9 @@ def validate_config(cfg):
     tm = pol.get("talk_max_turns")
     if not isinstance(tm, int) or isinstance(tm, bool) or not 0 <= tm <= 100000:
         errors.append("policy.talk_max_turns 须是 0–100000 的整数（0 表示不限）：%r" % (tm,))
+    mjp = pol.get("max_jobs")
+    if not isinstance(mjp, int) or isinstance(mjp, bool) or not 0 <= mjp <= 100:
+        errors.append("policy.max_jobs 须是 0–100 的整数（每人同时最多领几个任务，0 表示不限）：%r" % (mjp,))
     if pol.get("talk_burst") != "off" and parse_burst(pol.get("talk_burst")) is None:
         errors.append("policy.talk_burst 只能是 off，或「条数/秒数」如 20/300（条数 2–10000，秒数 10–86400）：%r"
                       % (pol.get("talk_burst"),))
@@ -668,6 +677,19 @@ def validate_config(cfg):
         tok = p.get("token_sha256")
         if tok and not re.match(r"^[0-9a-f]{64}$", str(tok)):
             errors.append("%s 的 token_sha256 须是 64 位小写十六进制" % p.get("name"))
+        for k in ("skills", "skills_proposed"):
+            v = p.get(k)
+            if v is not None and (not isinstance(v, list) or len(v) > MAX_SKILLS
+                                  or not all(isinstance(x, str) and SKILL_RE.match(x) for x in v)):
+                errors.append("%s 的 %s 须是不超过 %d 个技能标签的数组（小写字母或数字开头，可含 . + # _ -）" % (
+                    p.get("name"), k, MAX_SKILLS))
+        mj = p.get("max_jobs")
+        if mj is not None and (not isinstance(mj, int) or isinstance(mj, bool) or not 0 <= mj <= 100):
+            errors.append("%s 的 max_jobs 须是 0–100 的整数（0 表示不限）" % p.get("name"))
+        at = p.get("auto_take")
+        if at is not None and (not isinstance(at, list) or not all(
+                isinstance(x, str) and (x == "*" or (BOX_RE.match(x) and len(x) <= 64)) for x in at)):
+            errors.append("%s 的 auto_take 须是队列名的数组（* 表示全部队列）" % p.get("name"))
     utok = cfg.get("user_token_sha256")
     if utok and not re.match(r"^[0-9a-f]{64}$", str(utok)):
         errors.append("user_token_sha256 须是 64 位小写十六进制")
@@ -2436,7 +2458,97 @@ QUEUE_MAX_PENDING = 500
 QUEUE_KEEP_DONE = 100
 JOB_MAX = 16384
 JOB_FINAL = ("done", "failed", "cancelled")
-JOB_ZH = {"pending": "排队", "claimed": "已领", "done": "完成", "failed": "失败", "cancelled": "已取消"}
+JOB_ZH = {"pending": "排队", "claimed": "已领", "blocked": "卡住", "done": "完成", "failed": "失败", "cancelled": "已取消"}
+SKILL_RE = re.compile(r"^[a-z0-9][a-z0-9.+#_-]{0,31}$")
+MAX_SKILLS = 32
+PROGRESS_TELL = 300  # 同一任务的进度通知，至少隔这么多秒才再发一次
+
+
+def parse_skills(raw, what="技能"):
+    """「python, review」或列表 → 规范化的标签列表（小写、去重、保序）。"""
+    items = raw if isinstance(raw, list) else re.split(r"[,，、\s]+", raw or "")
+    out = []
+    for x in items:
+        x = str(x).strip().lower()
+        if not x:
+            continue
+        if not SKILL_RE.match(x):
+            raise CliError("看不懂的%s标签 %r：小写字母或数字开头，可含 . + # _ -，最长 32 个字符" % (what, x), 2)
+        if x not in out:
+            out.append(x)
+    if len(out) > MAX_SKILLS:
+        raise CliError("%s标签最多 %d 个" % (what, MAX_SKILLS), 2)
+    return out
+
+
+def max_jobs_of(p, cfg=None):
+    """同时最多领几个任务：本人的 max_jobs 优先，没设就看策略 policy.max_jobs（默认 1）；0 表示不限。"""
+    v = p.get("max_jobs")
+    if v is None or isinstance(v, bool):
+        v = ((cfg or {}).get("policy") or {}).get("max_jobs", 1)
+    return int(v) if isinstance(v, int) and not isinstance(v, bool) else 1
+
+
+def jobs_cap_text(n):
+    return ("同时最多领 %d 个" % n) if n else "同时领取不限"
+
+
+def jobs_held(mb, name, current=None):
+    """name 手上在做的任务数（已领、没卡住），跨全部队列。current=（队列名，队列）时用锁里的那份。"""
+    n = 0
+    for qn in queue_names(mb):
+        if current is not None and qn == current[0]:
+            q = current[1]
+        else:
+            try:
+                q = queue_view(mb, qn)
+            except CliError:
+                continue
+        n += sum(1 for j in q["jobs"] if j["status"] == "claimed" and j.get("claimed_by") == name)
+    return n
+
+
+def job_misfit(mb, q, j, p, held=None):
+    """p 领不了 j 的原因；能领返回 None。held 是 p 手上在做的任务数（None 表示不看并发上限）。
+    硬条件：排队中、没指派给别人、在领取名单里、有领取权限、具备全部所需技能、没拒绝过、手上没满。主控与用户不看技能和上限。"""
+    boss = is_boss(p)
+    if j["status"] != "pending":
+        return "现在是「%s」" % JOB_ZH.get(j["status"], j["status"])
+    if j.get("to") and j["to"] != p["name"]:
+        return "指派给了 %s" % j["to"]
+    if q.get("consumers") and p["name"] not in q["consumers"] and not boss:
+        return "不在队列的领取名单里"
+    if not mb.can(p, "queue.take", q["name"]):
+        return "没有领取权限"
+    lack = [x for x in j.get("needs") or [] if x not in (p.get("skills") or [])]
+    if lack and not boss:
+        return "缺技能 %s" % "、".join(lack)
+    if any(d.get("who") == p["name"] for d in j.get("declined") or []):
+        return "拒绝过"
+    cap = max_jobs_of(p, mb.cfg)
+    if held is not None and not boss and cap and held >= cap:
+        return "手上已有 %d 个（上限 %d）" % (held, cap)
+    return None
+
+
+def job_rank(j, p):
+    """领取顺序：优先级高的先；同优先级里指派给自己的先；再看加分标签命中多的；最后先来先到。"""
+    hit = len(set(j.get("prefers") or []) & set(p.get("skills") or []))
+    return (-int(j.get("priority") or 0), 0 if j.get("to") == p["name"] else 1, -hit, int(j["id"]))
+
+
+def job_takers(mb, q, j, exclude=()):
+    """（能接的人，其中手上有空的人）：只看在任的非主控参与方，不看并发上限算前者，看并发上限算后者。"""
+    able, idle = [], []
+    for p in mb.participants(True):
+        if p["role"] == "controller" or p["name"] in exclude or job_misfit(mb, q, j, p) is not None:
+            continue
+        able.append(p["name"])
+        held = jobs_held(mb, p["name"], current=(q["name"], q))
+        cap = max_jobs_of(p, mb.cfg)
+        if not cap or held < cap:
+            idle.append(p["name"])
+    return able, idle
 
 
 def queue_path(mb, name):
@@ -2526,15 +2638,19 @@ def queue_edit(mb, name, fn, create=None, actor=""):
     notes = []
     with FileLock(mb.p("locks", "queue-%s.lock" % name)):
         q = read_json_strict(path)
+        before = None
         if q is None:
             if create is None:
                 raise CliError("没有队列 %s（queue list 查看；主控或有 queue.admin 权限的人可 queue create）" % name, 2)
             q = create()
+        else:
+            before = dump_json(q)
         queue_expire(q, time.time(), notes)
         res = fn(q, notes)
         queue_prune(mb, q)
-        q["updated_at"] = iso_utc()
-        atomic_write(path, dump_json(q))
+        if before is None or dump_json(q) != before:  # 什么都没变（比如空领一次）就不重写，免得惊动别的等待方
+            q["updated_at"] = iso_utc()
+            atomic_write(path, dump_json(q))
     for names, kind, text, ref in notes:
         notify_system(mb, [n for n in names if n and n != actor], kind, text, actor or "", "队列 " + name, ref=ref)
     return res, q
@@ -2770,7 +2886,9 @@ def roster_rows(mb):
                      "inbox": mb.boxes_of(p) if p["active"] else ([p["box"]] if p["box"] else []),
                      "aliases": p["aliases"], "since": p["since"], "until": p["until"], "note": p["note"],
                      "allow": list(p.get("allow") or []), "deny": list(p.get("deny") or []),
-                     "token": bool(p.get("token_sha256"))})
+                     "token": bool(p.get("token_sha256")), "skills": list(p.get("skills") or []),
+                     "skills_proposed": p.get("skills_proposed"), "max_jobs": max_jobs_of(p, mb.cfg),
+                     "auto_take": list(p.get("auto_take") or [])})
     return rows
 
 
@@ -2796,6 +2914,11 @@ def cmd_roster_show(a):
             r["harness"] or "-", ("  会话 " + r["session"]) if r["session"] else "",
             ",".join(r["inbox"]) or "-", ("  别名 " + "、".join(r["aliases"])) if r["aliases"] else "",
             ("  权限 " + perms) if perms else "", "  [令牌]" if r["token"] else ""))
+        if r["skills"] or r["skills_proposed"] is not None or r["auto_take"] or r["max_jobs"] != max_jobs_of({}, mb.cfg):
+            emit("      技能 %s%s｜%s%s" % (
+                "、".join(r["skills"]) or "（无）",
+                ("（申报中：%s）" % ("、".join(r["skills_proposed"]) or "清空")) if r["skills_proposed"] is not None else "",
+                jobs_cap_text(r["max_jobs"]), ("｜自动接单 " + "、".join(r["auto_take"])) if r["auto_take"] else ""))
     for w in mb.config_warnings:
         emit("  注意：" + w)
     return 0
@@ -2811,15 +2934,20 @@ def cmd_roster_add(a):
     mb.require_roster_admin(me)
     if a.role == "controller":
         raise CliError("新参与方不能直接设为主控：先 add 为助手，再 roster handover", 2)
+    skills = parse_skills(a.skills) if getattr(a, "skills", None) is not None else []
+    if getattr(a, "max_jobs", None) is not None and not 0 <= a.max_jobs <= 100:
+        raise CliError("--max-jobs 须在 0–100 之间（0 表示不限）", 2)
 
     def fn(cfg):
         if any(p["name"] == a.name for p in cfg["participants"]):
             raise CliError("已有同名参与方 %s（恢复请用 roster update %s --activate）" % (a.name, a.name), 2)
         box = a.box or (default_box(a.name) if a.role == "assistant" else "")
-        cfg["participants"].append(norm_participant({
-            "name": a.name, "role": a.role, "display": a.display or a.name, "model": a.model, "harness": a.harness,
-            "session": a.session, "box": box, "aliases": a.alias or [], "active": True, "since": iso_utc(),
-            "note": a.note}))
+        rec = {"name": a.name, "role": a.role, "display": a.display or a.name, "model": a.model, "harness": a.harness,
+               "session": a.session, "box": box, "aliases": a.alias or [], "active": True, "since": iso_utc(),
+               "note": a.note, "skills": skills}
+        if getattr(a, "max_jobs", None) is not None:
+            rec["max_jobs"] = a.max_jobs
+        cfg["participants"].append(norm_participant(rec))
     cfg = mb.edit_config(me["name"], "add", fn, {"name": a.name, "role": a.role})
     p = [x for x in cfg["participants"] if x["name"] == a.name][0]
     emit("已加入 %s（%s，%s / %s，收件箱 %s）；在任助手 %d/%d" % (
@@ -2834,12 +2962,23 @@ def cmd_roster_update(a):
     target = mb.get(a.name)
     if target is None:
         raise CliError("花名册里没有 %s" % a.name, 2)
-    self_fields = {"model", "harness", "session", "note"}
-    asked = set(k for k in ("display", "model", "harness", "session", "box", "note") if getattr(a, k) is not None)
+    self_fields = {"model", "harness", "session", "note", "auto_take"}
+    asked = set(k for k in ("display", "model", "harness", "session", "box", "note", "skills", "max_jobs", "auto_take")
+                if getattr(a, k, None) is not None)
     if a.alias_add or a.alias_remove or a.activate:
         asked.add("roster")
     if not asked:
         raise CliError("没有要改的字段", 2)
+    skills = parse_skills(a.skills) if getattr(a, "skills", None) is not None else None
+    if getattr(a, "max_jobs", None) is not None and not 0 <= a.max_jobs <= 100:
+        raise CliError("--max-jobs 须在 0–100 之间（0 表示不限）", 2)
+    auto = None
+    if getattr(a, "auto_take", None) is not None:
+        raw = a.auto_take.strip().lower()
+        auto = [] if raw in ("", "off", "none") else (["*"] if raw == "*" else
+                                                      [check_queue_name(x) for x in re.split(r"[,，、\s]+", raw) if x])
+    if skills is not None and me is not USER and me["name"] == a.name and not (is_boss(me) or mb.can(me, "roster.admin")):
+        raise CliError("自己的技能要申报、由主控批准：roster skills %s --set %s" % (a.name, ",".join(skills)), 2)
     if not (me is not USER and me["name"] == a.name and asked <= self_fields):
         if target["role"] == "controller" and target["active"]:
             mb.require_controller(me)  # 代管花名册的人不能改主控
@@ -2852,6 +2991,13 @@ def cmd_roster_update(a):
             v = getattr(a, k)
             if v is not None:
                 p[k] = v
+        if skills is not None:
+            p["skills"] = skills
+            p.pop("skills_proposed", None)
+        if getattr(a, "max_jobs", None) is not None:
+            p["max_jobs"] = a.max_jobs
+        if auto is not None:
+            p["auto_take"] = auto
         for x in a.alias_add or []:
             if x not in p["aliases"]:
                 p["aliases"].append(x)
@@ -2874,6 +3020,85 @@ def cmd_roster_update(a):
             mb.adopt_box(target["name"], box_after)
     mb.edit_config(me["name"], "update", fn, {"name": a.name, "fields": sorted(asked)})
     emit("已更新 %s：%s" % (a.name, "、".join(sorted(asked))))
+    return 0
+
+
+def skills_text(xs):
+    return "、".join(xs) if xs else "（无）"
+
+
+def cmd_roster_skills(a):
+    """技能：本人申报（--set），主控、用户或 roster.admin 批准（--approve）、驳回（--reject），也可直接设（--set）。"""
+    mb = open_mb(a)
+    if a.set is None and not a.approve and not a.reject:
+        ps = [mb.lookup(a.name)] if a.name else mb.participants(True)
+        rows = [{"name": p["name"], "role": p["role"], "skills": list(p.get("skills") or []),
+                 "proposed": p.get("skills_proposed"), "max_jobs": max_jobs_of(p, mb.cfg),
+                 "auto_take": list(p.get("auto_take") or [])} for p in ps]
+        if a.json:
+            emit_json({"participants": rows})
+            return 0
+        for r in rows:
+            emit("%s（%s）技能 %s%s｜%s%s" % (
+                r["name"], ROLE_ZH.get(r["role"], r["role"]), skills_text(r["skills"]),
+                ("｜申报中：%s" % skills_text(r["proposed"])) if r["proposed"] is not None else "", jobs_cap_text(r["max_jobs"]),
+                ("｜自动接单 " + "、".join(r["auto_take"])) if r["auto_take"] else ""))
+        return 0
+    if sum(1 for x in (a.set is not None, a.approve, a.reject) if x) > 1:
+        raise CliError("--set、--approve、--reject 一次只能用一个", 2)
+    me = mb.identity(a.me or "")
+    if not a.name:
+        raise CliError("要给参与方名：roster skills <名字> --set …", 2)
+    t = mb.lookup(a.name)
+    admin = me is USER or is_boss(me) or mb.can(me, "roster.admin")
+    if t["role"] == "controller" and t["active"] and not is_boss(me):
+        raise CliError("主控的技能只有主控本人或用户能改", 2)
+
+    def edit(fn, action, detail):
+        def f(cfg):
+            fn([x for x in cfg["participants"] if x["name"] == t["name"]][0])
+        mb.edit_config(me["name"], action, f, dict(detail, name=t["name"]))
+    if a.approve or a.reject:
+        if not admin:
+            raise CliError("只有主控、用户或有 roster.admin 的人能批准或驳回技能申报", 2)
+        detail = {}
+
+        def fn(p):
+            prop = p.get("skills_proposed")  # 在锁里读：本人刚改过申报，批的就是最新的那份
+            if prop is None:
+                raise CliError("%s 没有待批的技能申报" % t["name"], 2)
+            detail["skills"] = list(prop)
+            if a.approve:
+                p["skills"] = list(prop)
+            p.pop("skills_proposed", None)
+        edit(fn, "skills-approve" if a.approve else "skills-reject", detail)
+        prop = detail["skills"]
+        if t["name"] != me["name"]:
+            notify_system(mb, [t["name"]], "skills", "%s %s了你申报的技能 %s%s" % (
+                me["name"], "批准" if a.approve else "驳回", skills_text(prop),
+                ("：" + clip(a.reason, 300)) if a.reject and a.reason else ""), me["name"], "技能申报")
+        emit("已%s %s 的技能申报：%s" % ("批准" if a.approve else "驳回", t["name"], skills_text(prop)))
+        return 0
+    skills = parse_skills(a.set)
+    if admin:
+        def fn(p):
+            p["skills"] = skills
+            p.pop("skills_proposed", None)
+        edit(fn, "skills-set", {"skills": skills})
+        if t["name"] != me["name"]:
+            notify_system(mb, [t["name"]], "skills", "%s 把你的技能设为 %s" % (me["name"], skills_text(skills)), me["name"], "技能变更")
+        emit("已把 %s 的技能设为 %s" % (t["name"], skills_text(skills)))
+        return 0
+    if me["name"] != t["name"]:
+        raise CliError("只能申报自己的技能；改别人的要主控、用户或有 roster.admin 的人", 2)
+
+    def fn(p):
+        p["skills_proposed"] = skills
+    edit(fn, "skills-propose", {"skills": skills})
+    notify_system(mb, roster_admins(mb), "skills", "%s 申报技能：%s（现在：%s）。批准用 roster skills %s --approve，驳回用 --reject"
+                                                   "（MCP：mailbox_roster skills）" % (
+                      me["name"], skills_text(skills), skills_text(t.get("skills") or []), me["name"]), me["name"], "技能申报")
+    emit("已申报技能 %s，等主控批准（批准前仍按现有技能 %s 分派任务）" % (skills_text(skills), skills_text(t.get("skills") or [])))
     return 0
 
 
@@ -2918,11 +3143,13 @@ def cmd_roster_policy(a):
     me = mb.identity(a.me or "")
     mb.require_controller(me)
     changes = dict((k, getattr(a, k)) for k in ("assistant_to_assistant", "broadcast", "inactive_send",
-                                                "talk_max_turns", "talk_burst")
+                                                "talk_max_turns", "talk_burst", "max_jobs")
                    if getattr(a, k, None) is not None)
     if not changes:
         emit_json(mb.cfg["policy"])
         return 0
+    if "max_jobs" in changes and not 0 <= changes["max_jobs"] <= 100:
+        raise CliError("--max-jobs 须在 0–100 之间（0 表示不限）", 2)
     if "talk_max_turns" in changes and not 0 <= changes["talk_max_turns"] <= 100000:
         raise CliError("--talk-max-turns 须在 0–100000 之间（0 表示不限）", 2)
     if "talk_burst" in changes and changes["talk_burst"] != "off" and parse_burst(changes["talk_burst"]) is None:
@@ -4852,6 +5079,9 @@ def cmd_talk_wait(a):
 def job_brief(q, j):
     d = dict((k, j.get(k)) for k in ("id", "title", "from", "at", "priority", "to", "status", "attempts", "claimed_by",
                                     "claimed_at", "lease_until", "finished_at", "finished_by", "error"))
+    for k in ("needs", "prefers", "progress", "blocked", "declined"):
+        if j.get(k):
+            d[k] = j[k]
     d["queue"] = q["name"]
     if j["status"] == "pending":
         d["position"] = queue_position(q, j["id"])
@@ -4864,18 +5094,32 @@ def job_lines(mb, q, j, full=False):
         st += "，第 %d 位" % queue_position(q, j["id"])
     elif j["status"] == "claimed":
         st += "：%s，租约到 %s" % (j.get("claimed_by"), fmt_when(mb, j.get("lease_until")))
+        pg = j.get("progress") or {}
+        if pg.get("pct") is not None:
+            st += "，进度 %d%%" % pg["pct"]
+    elif j["status"] == "blocked":
+        st += "：%s，%s" % (j.get("claimed_by"), clip((j.get("blocked") or {}).get("reason") or "", 120))
     elif j.get("finished_by"):
         st += "：%s" % j["finished_by"]
-    head = "#%d [%s] %s「%s」｜%s 投于 %s%s%s%s" % (
+    head = "#%d [%s] %s「%s」｜%s 投于 %s%s%s%s%s%s" % (
         j["id"], st, ("优先级 %d " % j["priority"]) if j.get("priority") else "", j.get("title"), j.get("from"),
         fmt_when(mb, j.get("at")), ("｜指派 " + j["to"]) if j.get("to") else "",
-        ("｜第 %d 次尝试" % j["attempts"]) if j.get("attempts") else "", ("｜" + clip(j["error"], 200)) if j.get("error") else "")
+        ("｜需要 " + "、".join(j["needs"])) if j.get("needs") else "",
+        ("｜第 %d 次尝试" % j["attempts"]) if j.get("attempts") else "",
+        ("｜拒绝过：" + "、".join(d["who"] for d in j["declined"])) if j.get("declined") else "",
+        ("｜" + clip(j["error"], 200)) if j.get("error") else "")
     out = [head]
     if full:
         if j.get("body"):
             out += ["  内容："] + ["    " + l for l in j["body"].split("\n")]
         if j.get("result"):
             out += ["  结果："] + ["    " + l for l in j["result"].split("\n")]
+        pg = j.get("progress") or {}
+        if pg:
+            out.append("  进度：%s%s（%s %s）" % (("%d%% " % pg["pct"]) if pg.get("pct") is not None else "", pg.get("text") or "",
+                                              pg.get("by") or "", fmt_when(mb, pg.get("at"))))
+        for d in j.get("declined") or []:
+            out.append("  拒绝：%s %s%s" % (d.get("who"), fmt_when(mb, d.get("at")), ("：" + d["reason"]) if d.get("reason") else ""))
         for at, ev, who, detail in j.get("log") or []:
             out.append("  · %s %s %s%s" % (fmt_when(mb, at), ev, who, ("：" + detail) if detail else ""))
     return out
@@ -4926,8 +5170,9 @@ def cmd_queue_list(a):
         if "error" in r:
             emit("  %s｜读不了：%s" % (r["name"], r["error"]))
             continue
-        emit("  %s%s｜排队 %d，已领 %d，完成 %d，失败 %d｜租约 %d 秒，最多尝试 %d 次%s" % (
-            r["name"], ("（%s）" % r["desc"]) if r["desc"] else "", r["pending"], r["claimed"], r["done"], r["failed"],
+        emit("  %s%s｜排队 %d，已领 %d%s，完成 %d，失败 %d｜租约 %d 秒，最多尝试 %d 次%s" % (
+            r["name"], ("（%s）" % r["desc"]) if r["desc"] else "", r["pending"], r["claimed"],
+            ("，卡住 %d" % r["blocked"]) if r.get("blocked") else "", r["done"], r["failed"],
             r["lease_seconds"], r["max_attempts"], ("｜领取名单 " + "、".join(r["consumers"])) if r["consumers"] else ""))
     if not rows:
         emit("  （还没有队列；主控用 queue create <名字> 建，或直接 queue push）")
@@ -4979,6 +5224,8 @@ def cmd_queue_push(a):
     check_text(title, "任务标题", 600, a.allow_secret, mb.cfg.get("secret_patterns"))
     raw = text_arg(a, "任务内容", required=False)
     body = check_text(raw, "任务内容", JOB_MAX, a.allow_secret, mb.cfg.get("secret_patterns")) if raw is not None else ""
+    needs = parse_skills(getattr(a, "needs", None) or "", "所需技能")
+    prefers = parse_skills(getattr(a, "prefers", None) or "", "加分技能")
     to = None
     if a.to:
         to = mb.lookup(a.to)
@@ -4986,6 +5233,10 @@ def cmd_queue_push(a):
             raise CliError("%s 已不在任" % to["name"], 2)
         if not mb.can(to, "queue.take", name):
             raise CliError("%s 没有从队列 %s 领任务的权限（queue.take），指派了也领不了" % (to["name"], name), 2)
+        lack = [x for x in needs if x not in (to.get("skills") or [])]
+        if lack and not is_boss(to):
+            raise CliError("%s 缺技能 %s，指派了也领不了（去掉 --to 或 --needs，或先给他补技能：roster skills %s --set …）" % (
+                to["name"], "、".join(lack), to["name"]), 2)
     create = None
     if not os.path.exists(queue_path(mb, name)):
         if not mb.can(me, "queue.admin", name):
@@ -5002,16 +5253,36 @@ def cmd_queue_push(a):
              "priority": int(a.priority or 0), "to": to["name"] if to else "", "status": "pending", "attempts": 0,
              "claimed_by": "", "claimed_at": "", "lease_until": "", "result": "", "error": "", "finished_at": "",
              "finished_by": ""}
+        if needs:
+            j["needs"] = needs
+        if prefers:
+            j["prefers"] = prefers
         job_log(j, "pushed", me["name"])
         q["jobs"].append(j)
         pos = queue_position(q, j["id"])
-        recips = [j["to"]] if j["to"] else (queue_consumers(mb, q, me) if q.get("notify", True) else [])
+        ref = {"queue": name, "job": j["id"]}
+        able, idle = ([j["to"]], [j["to"]]) if j["to"] else job_takers(mb, q, j, exclude=(me["name"],))
+        if j["to"]:
+            recips = [j["to"]]
+        elif q.get("notify", True):
+            # 只通知能接的人：先找手上有空的，都忙就通知所有能接的；没人具备所需技能就告诉主控
+            recips = idle or able
+            if not able:
+                try:
+                    boss = mb.controller()["name"]
+                except CliError:
+                    boss = ""
+                notes.append(([boss], "job-unclaimed", "队列 %s 的新任务 #%d「%s」暂时没人能接%s：可以给某人补技能（roster skills）、"
+                                                      "放宽要求，或直接指派" % (name, j["id"], j["title"],
+                                                                         ("（需要技能 %s）" % "、".join(needs)) if needs else ""), ref))
+        else:
+            recips = []
         if recips:
-            notes.append((recips, "job", "队列 %s 有新任务 #%d「%s」%s（优先级 %d，前面还有 %d 个）：用 queue take %s 领取"
-                                         "（MCP：mailbox_queue take）" % (name, j["id"], j["title"], "，指派给你" if j["to"] else "",
-                                                                        j["priority"], pos - 1, name),
-                          {"queue": name, "job": j["id"]}))
-        return dict(j)
+            notes.append((recips, "job", "队列 %s 有新任务 #%d「%s」%s%s（优先级 %d，前面还有 %d 个）：用 queue take %s 领取"
+                                         "（MCP：mailbox_queue take）" % (
+                              name, j["id"], j["title"], "，指派给你" if j["to"] else "",
+                              ("，需要技能 %s" % "、".join(needs)) if needs else "", j["priority"], pos - 1, name), ref))
+        return dict(j, takers=able)
     j, q = queue_edit(mb, name, fn, create=create, actor=me["name"])
     if (a.wait or 0) > 0:
         got = queue_wait_final(mb, name, j["id"], a.wait, who=me["name"])
@@ -5025,23 +5296,43 @@ def cmd_queue_push(a):
                 name, j["id"], a.wait, name, j["id"]))
         return 3
     if a.json:
-        emit_json(job_brief(q, queue_job(q, j["id"])))
+        emit_json(dict(job_brief(q, queue_job(q, j["id"])), takers=j["takers"]))
     else:
-        emit("已投到队列 %s：任务 #%d「%s」｜排第 %d 位%s" % (name, j["id"], j["title"], queue_position(q, j["id"]),
-                                                    ("｜指派 " + j["to"]) if j["to"] else ""))
+        emit("已投到队列 %s：任务 #%d「%s」｜排第 %d 位%s｜%s" % (
+            name, j["id"], j["title"], queue_position(q, j["id"]), ("｜指派 " + j["to"]) if j["to"] else "",
+            ("能接的人：" + "、".join(j["takers"])) if j["takers"] else "暂时没人能接（缺所需技能或权限；可补技能、放宽要求或指派）"))
     return 0
 
 
-def queue_try_take(mb, me, name):
-    boss = me is USER or (me["role"] == "controller" and me["active"])
+def queue_try_take(mb, me, name, job_id=None, why=None):
+    """领一个任务：给了 job_id 就领那一个（领不了报原因），否则领本方能领的里面排最前的。
+    领不到返回 None；why 是字典时填入排队中的任务各自领不了的原因（原因 → 个数）。"""
+    boss = is_boss(me)
 
     def fn(q, notes):
         if q.get("consumers") and me["name"] not in q["consumers"] and not boss:
             raise CliError("你不在队列 %s 的领取名单里（%s）" % (name, "、".join(q["consumers"])), 2)
-        cands = [j for j in q["jobs"] if j["status"] == "pending" and (not j.get("to") or j.get("to") == me["name"])]
-        if not cands:
-            return None
-        cands.sort(key=lambda j: (-int(j.get("priority") or 0), 0 if j.get("to") == me["name"] else 1, j["id"]))
+        held = jobs_held(mb, me["name"], current=(name, q))
+        if job_id is not None:
+            j = queue_job(q, job_id)
+            bad = job_misfit(mb, q, j, me, held)
+            if bad:
+                raise CliError("领不了队列 %s 的任务 #%d：%s" % (name, job_id, bad), 2)
+            cands = [j]
+        else:
+            cands = []
+            for j in q["jobs"]:
+                if j["status"] != "pending":
+                    continue
+                bad = job_misfit(mb, q, j, me, held)
+                if bad is None:
+                    cands.append(j)
+                elif why is not None:
+                    key = next((k for k in ("手上已满", "缺技能", "指派给了别人") if bad.startswith(k[:2])), bad)
+                    why[key] = why.get(key, 0) + 1
+            if not cands:
+                return None
+            cands.sort(key=lambda x: job_rank(x, me))
         j = cands[0]
         j.update(status="claimed", claimed_by=me["name"], claimed_at=iso_utc(),
                  lease_until=iso_at(time.time() + int(q.get("lease_seconds") or 900)))
@@ -5060,7 +5351,8 @@ def cmd_queue_take(a):
     me = mb.identity(a.me or "")
     name = check_queue_name(a.name)
     mb.require_perm(me, "queue.take", name)
-    got = queue_try_take(mb, me, name)
+    why = {}
+    got = queue_try_take(mb, me, name, getattr(a, "job", None), why)
     if got is None and (a.wait or 0) > 0:
         state = {"key": None, "at": time.time()}
 
@@ -5074,13 +5366,15 @@ def cmd_queue_take(a):
             if key == state["key"] and time.time() - state["at"] < 10:
                 return None
             state["key"], state["at"] = key, time.time()
-            return queue_try_take(mb, me, name)
+            why.clear()
+            return queue_try_take(mb, me, name, None, why)
         got = poll_until(a.wait, tick, bell=(mb, me["name"]))
     if got is None:
         if a.json:
-            emit_json({"empty": True, "queue": name})
+            emit_json({"empty": True, "queue": name, "why": why})
         else:
-            emit(("TIMEOUT %d 秒内" % a.wait if (a.wait or 0) > 0 else "现在") + "队列 %s 没有可领的任务" % name)
+            emit(("TIMEOUT %d 秒内" % a.wait if (a.wait or 0) > 0 else "现在") + "队列 %s 没有你能领的任务%s" % (
+                name, ("（排队中的：%s）" % "，".join("%s %d 个" % (k, v) for k, v in sorted(why.items()))) if why else ""))
         return 3
     q, j = got
     if a.json:
@@ -5099,24 +5393,46 @@ def cmd_queue_act(a):
     name = check_queue_name(a.name)
     admin = mb.can(me, "queue.admin", name)
     raw = text_arg(a, "说明", required=False)
-    text = check_text(raw, "结果" if op == "done" else "说明", JOB_MAX, a.allow_secret,
-                      mb.cfg.get("secret_patterns")) if raw is not None else ""
+    what = {"done": "结果", "progress": "进度说明", "block": "卡住的原因", "decline": "拒绝的原因", "unblock": "答复"}.get(op, "说明")
+    text = check_text(raw, what, JOB_MAX, a.allow_secret, mb.cfg.get("secret_patterns")) if raw is not None else ""
+    pct = getattr(a, "pct", None)
+    if op == "progress":
+        if pct is None and not text:
+            raise CliError("progress 要给 --pct（0–100）或 --text", 2)
+        if pct is not None and not 0 <= pct <= 100:
+            raise CliError("--pct 须在 0–100 之间", 2)
+    if op == "block" and not text:
+        raise CliError("block 要用 --text 写明卡在哪、需要谁做什么：主控据此处理", 2)
+    if op == "decline":
+        mb.require_perm(me, "queue.take", name)  # 拒绝是领取方的事：没有领取权限的人拒绝了也不影响分派
+    try:
+        boss = mb.controller()["name"]
+    except CliError:
+        boss = ""
 
     def fn(q, notes):
         j = queue_job(q, a.job)
         ref = {"queue": name, "job": j["id"]}
-        if op in ("done", "fail", "release", "renew"):
-            if j["status"] != "claimed":
+        holder = j.get("claimed_by") or ""
+        mine = holder == me["name"]
+        lease = int(q.get("lease_seconds") or 900)
+        now = time.time()
+        if op in ("done", "fail", "release", "renew", "progress", "block") or (op == "decline" and j["status"] != "pending"):
+            states = ("claimed",) if op in ("renew", "progress", "block") else ("claimed", "blocked")
+            if j["status"] not in states:
                 hint = "（租约可能已到期、任务已放回排队或判为失败）" if j["status"] in ("pending", "failed") else ""
-                raise CliError("任务 #%d 现在是「%s」，不是已领状态%s" % (j["id"], JOB_ZH.get(j["status"]), hint), 2)
-            if j.get("claimed_by") != me["name"] and not admin:
-                raise CliError("任务 #%d 由 %s 领取，你不能处置（要 queue.admin 权限）" % (j["id"], j.get("claimed_by")), 2)
+                raise CliError("任务 #%d 现在是「%s」，不能 %s%s" % (j["id"], JOB_ZH.get(j["status"], j["status"]), op, hint), 2)
+            if not mine and not (admin and op in ("done", "fail", "release", "renew")):
+                raise CliError("任务 #%d 由 %s 领取，你不能 %s%s" % (
+                    j["id"], holder, op, "（要 queue.admin 权限）" if op in ("done", "fail", "release", "renew") else ""), 2)
         if op == "done":
             j.update(status="done", result=text, finished_at=iso_utc(), finished_by=me["name"], lease_until="")
+            j.pop("blocked", None)
             job_log(j, "done", me["name"])
             notes.append(([j.get("from")], "job-done", "队列 %s 的任务 #%d「%s」已由 %s 完成%s" % (
                 name, j["id"], j.get("title"), me["name"], ("：" + clip(text, 1500)) if text else ""), ref))
         elif op == "fail":
+            j.pop("blocked", None)
             if a.retry and int(j.get("attempts") or 0) < int(q.get("max_attempts") or 1):
                 j.update(status="pending", claimed_by="", claimed_at="", lease_until="", error=clip(text, 2000))
                 job_log(j, "retry", me["name"], text)
@@ -5127,20 +5443,75 @@ def cmd_queue_act(a):
                 notes.append(([j.get("from")], "job-failed", "队列 %s 的任务 #%d「%s」失败（%s）：%s" % (
                     name, j["id"], j.get("title"), me["name"], j["error"]), ref))
         elif op == "release":
+            j.pop("blocked", None)
             j.update(status="pending", claimed_by="", claimed_at="", lease_until="",
                      attempts=max(0, int(j.get("attempts") or 0) - 1))
             job_log(j, "released", me["name"], text)
         elif op == "renew":
-            j["lease_until"] = iso_at(time.time() + int(q.get("lease_seconds") or 900))
+            j["lease_until"] = iso_at(now + lease)
             job_log(j, "renewed", me["name"])
+        elif op == "progress":
+            old = j.get("progress") or {}
+            j["progress"] = {"pct": pct if pct is not None else old.get("pct"), "text": clip(text, 500) or old.get("text") or "",
+                             "at": iso_utc(), "by": me["name"]}
+            j["lease_until"] = iso_at(now + lease)  # 报进度就是在干活：顺带续租
+            job_log(j, "progress", me["name"], ("%d%% " % pct if pct is not None else "") + text)
+            if j.get("from") and j["from"] != me["name"] and now - float(j.get("progress_told") or 0) >= PROGRESS_TELL:
+                j["progress_told"] = now
+                p = j["progress"]
+                notes.append(([j["from"]], "job-progress", "队列 %s 的任务 #%d「%s」进度%s%s（%s）" % (
+                    name, j["id"], j.get("title"), (" %d%%" % p["pct"]) if p.get("pct") is not None else "",
+                    ("：" + clip(p["text"], 300)) if p.get("text") else "", me["name"]), ref))
+        elif op == "block":
+            j.update(status="blocked", lease_until="", blocked={"at": iso_utc(), "by": me["name"], "reason": clip(text, 2000)})
+            job_log(j, "blocked", me["name"], text)
+            notes.append(([j.get("from"), boss], "job-blocked", "%s 卡在队列 %s 的任务 #%d「%s」：%s。处理好后用 queue unblock %s %d "
+                                                                "--text …（MCP：mailbox_queue unblock）；卡住期间租约暂停" % (
+                              me["name"], name, j["id"], j.get("title"), clip(text, 1500), name, j["id"]), ref))
+        elif op == "unblock":
+            if j["status"] != "blocked":
+                raise CliError("任务 #%d 没有卡住（现在是「%s」）" % (j["id"], JOB_ZH.get(j["status"], j["status"])), 2)
+            if not (mine or j.get("from") == me["name"] or admin):
+                raise CliError("只有领取方（%s）、投放者（%s）或有 queue.admin 权限的人能解除卡住" % (holder, j.get("from")), 2)
+            j.update(status="claimed", lease_until=iso_at(now + lease))
+            j.pop("blocked", None)
+            job_log(j, "unblocked", me["name"], text)
+            notes.append(([holder, j.get("from")], "job", "%s 解除了队列 %s 任务 #%d「%s」的卡住%s；租约重新计时" % (
+                me["name"], name, j["id"], j.get("title"), ("：" + clip(text, 1500)) if text else ""), ref))
+        elif op == "decline":
+            if any(d.get("who") == me["name"] for d in j.get("declined") or []) and j["status"] == "pending":
+                raise CliError("你已经拒绝过任务 #%d" % j["id"], 2)
+            if j["status"] in JOB_FINAL:
+                raise CliError("任务 #%d 已经%s" % (j["id"], JOB_ZH[j["status"]]), 2)
+            if j["status"] == "pending" and j.get("to") and j["to"] != me["name"]:
+                raise CliError("任务 #%d 指派给了 %s，本来就不会分给你" % (j["id"], j["to"]), 2)
+            if j["status"] != "pending":  # 领了又不合适：放回排队，不算一次尝试
+                j.update(status="pending", claimed_by="", claimed_at="", lease_until="",
+                         attempts=max(0, int(j.get("attempts") or 0) - 1))
+                j.pop("blocked", None)
+            j.setdefault("declined", []).append({"who": me["name"], "reason": clip(text, 300), "at": iso_utc()})
+            job_log(j, "declined", me["name"], text)
+            able, idle = job_takers(mb, q, j)
+            if j.get("from") and j["from"] != me["name"]:
+                notes.append(([j["from"]], "job", "%s 拒绝了队列 %s 的任务 #%d「%s」%s%s" % (
+                    me["name"], name, j["id"], j.get("title"), ("：" + clip(text, 300)) if text else "",
+                    "" if able else "；现在没人能接了"), ref))
+            if not able:
+                notes.append(([boss], "job-unclaimed", "队列 %s 的任务 #%d「%s」没人能接了（拒绝过的：%s）：可以补技能、放宽要求或直接指派" % (
+                    name, j["id"], j.get("title"), "、".join("%s（%s）" % (d["who"], d.get("reason") or "未说明")
+                                                         for d in j["declined"])), ref))
+            elif idle:
+                notes.append((idle, "job", "队列 %s 的任务 #%d「%s」等人接（%s 拒绝了）：用 queue take %s 领取（MCP：mailbox_queue take）" % (
+                    name, j["id"], j.get("title"), me["name"], name), ref))
         else:
             if j.get("from") != me["name"] and not admin:
                 raise CliError("只有投放者（%s）或有 queue.admin 权限的人能取消任务 #%d" % (j.get("from"), j["id"]), 2)
             if j["status"] in JOB_FINAL:
                 raise CliError("任务 #%d 已经%s" % (j["id"], JOB_ZH[j["status"]]), 2)
-            holder = j.get("claimed_by") if j["status"] == "claimed" else ""
+            holder = j.get("claimed_by") if j["status"] in ("claimed", "blocked") else ""
             j.update(status="cancelled", error=clip(text, 2000), finished_at=iso_utc(), finished_by=me["name"],
                      lease_until="")
+            j.pop("blocked", None)
             job_log(j, "cancelled", me["name"], text)
             if holder:
                 notes.append(([holder], "job", "%s 取消了你领着的队列 %s 任务 #%d「%s」%s" % (
@@ -5151,9 +5522,10 @@ def cmd_queue_act(a):
         emit_job_result(mb, a, q, j)
     else:
         word = {"done": "完成", "fail": "记为失败" if j["status"] == "failed" else "放回重试", "release": "放回排队",
-                "renew": "续租", "cancel": "取消"}[op]
-        emit("已%s队列 %s 的任务 #%d" % (word, name, j["id"]) +
-             ("（租约到 %s）" % fmt_when(mb, j.get("lease_until")) if op == "renew" else ""))
+                "renew": "续租", "cancel": "取消", "decline": "拒绝", "progress": "记下进度", "block": "标为卡住",
+                "unblock": "解除卡住"}[op]
+        emit("已%s：队列 %s 的任务 #%d" % (word, name, j["id"]) +
+             ("（租约到 %s）" % fmt_when(mb, j.get("lease_until")) if op in ("renew", "progress", "unblock") else ""))
     return 0
 
 
@@ -5162,7 +5534,7 @@ def cmd_queue_show(a):
     name = check_queue_name(a.name)
     q = queue_view(mb, name)
     pend = queue_pending(q)
-    claimed = [j for j in q["jobs"] if j["status"] == "claimed"]
+    claimed = [j for j in q["jobs"] if j["status"] in ("claimed", "blocked")]
     done = sorted([j for j in q["jobs"] if j["status"] in JOB_FINAL], key=lambda j: (j.get("finished_at") or "", j["id"]))
     if not a.all:
         done = done[-10:]
@@ -5171,8 +5543,9 @@ def cmd_queue_show(a):
                    "pending": [job_brief(q, j) for j in pend], "claimed": [job_brief(q, j) for j in claimed],
                    "finished": [job_brief(q, j) for j in done]})
         return 0
-    emit("队列 %s%s｜排队 %d｜已领 %d｜租约 %d 秒｜最多尝试 %d 次" % (
-        name, ("（%s）" % q["desc"]) if q.get("desc") else "", len(pend), len(claimed), q["lease_seconds"], q["max_attempts"]))
+    emit("队列 %s%s｜排队 %d｜已领 %d（其中卡住 %d）｜租约 %d 秒｜最多尝试 %d 次" % (
+        name, ("（%s）" % q["desc"]) if q.get("desc") else "", len(pend), len(claimed),
+        len([j for j in claimed if j["status"] == "blocked"]), q["lease_seconds"], q["max_attempts"]))
     for label, xs in (("排队", pend), ("已领", claimed), ("最近完成" if not a.all else "已结束", done)):
         if xs:
             emit("%s：" % label)
@@ -5230,6 +5603,7 @@ def cmd_join(a):
         emit("%s 已在花名册里（%s，在任），不用申请" % (name, ROLE_ZH.get(p["role"], p["role"])))
         return 0
     mb.require_writable()
+    skills = parse_skills(a.skills) if getattr(a, "skills", None) is not None else None
     fresh = False
     with FileLock(mb.p("locks", "requests.lock")):
         cur = load_json_quiet(path) or {}
@@ -5238,14 +5612,16 @@ def cmd_join(a):
             raise CliError("待批的加入申请已有 %d 个，请等主控处理" % len(pend), 2)
         d = {"name": name, "model": a.model or cur.get("model") or "", "harness": a.harness or cur.get("harness") or "",
              "display": a.display or cur.get("display") or "", "note": clip(a.note or cur.get("note") or "", 300),
-             "role": a.role, "host": HOST, "updated_at": iso_utc(), "status": "pending"}
-        fresh = cur.get("status") != "pending" or any(cur.get(k) != d[k] for k in ("model", "harness", "note", "role"))
+             "role": a.role, "host": HOST, "updated_at": iso_utc(), "status": "pending",
+             "skills": skills if skills is not None else list(cur.get("skills") or [])}
+        fresh = cur.get("status") != "pending" or any(cur.get(k) != d[k] for k in ("model", "harness", "note", "role", "skills"))
         d["at"] = cur.get("at") if cur.get("status") == "pending" else iso_utc()
         atomic_write(path, dump_json(d))
     if fresh:
-        notify_system(mb, roster_admins(mb), "join", "%s（%s / %s）申请以%s身份加入%s：用 roster approve %s 批准（可加 --allow 授权），"
-                                                     "或 roster reject %s（MCP：mailbox_roster approve / reject）" % (
+        notify_system(mb, roster_admins(mb), "join", "%s（%s / %s）申请以%s身份加入%s%s：用 roster approve %s 批准（可加 --allow 授权、"
+                                                     "--skills 改技能），或 roster reject %s（MCP：mailbox_roster approve / reject）" % (
                           name, d["model"] or "-", d["harness"] or "-", ROLE_ZH.get(d["role"]),
+                          ("，申报技能：" + "、".join(d["skills"])) if d["skills"] else "",
                           ("，附言：" + d["note"]) if d["note"] else "", name, name), name, "加入申请")
     if (a.wait or 0) > 0:
         def check():
@@ -5274,10 +5650,10 @@ def cmd_roster_requests(a):
         return 0
     emit("加入申请 %d 个%s" % (len(rows), "" if a.all else "（待批）"))
     for r in rows:
-        emit("  %s｜%s / %s｜申请%s｜%s｜%s%s" % (
+        emit("  %s｜%s / %s｜申请%s｜%s｜%s%s%s" % (
             r.get("name"), r.get("model") or "-", r.get("harness") or "-", ROLE_ZH.get(r.get("role"), r.get("role")),
             fmt_when(mb, r.get("at")), {"pending": "待批", "approved": "已批", "rejected": "已拒"}.get(r.get("status"), "?"),
-            ("｜附言：" + r["note"]) if r.get("note") else ""))
+            ("｜申报技能 " + "、".join(r["skills"])) if r.get("skills") else "", ("｜附言：" + r["note"]) if r.get("note") else ""))
     return 0
 
 
@@ -5300,6 +5676,7 @@ def cmd_roster_decide(a):
     allow, deny = parse_perm_args(mb, a.allow), parse_perm_args(mb, a.deny)
     if allow or deny:
         mb.require_controller(me)  # 代管花名册的人能批准加入，但不能顺带授权
+    skills = parse_skills(a.skills) if getattr(a, "skills", None) is not None else parse_skills(req.get("skills") or [])
     role = a.role or req.get("role") or "assistant"
     old = mb.get(a.name)
     box = a.box or (old or {}).get("box") or (default_box(a.name) if role == "assistant" else "")
@@ -5311,7 +5688,7 @@ def cmd_roster_decide(a):
     def fn(cfg):
         rec = {"name": a.name, "role": role, "display": req.get("display") or a.name, "model": req.get("model") or "",
                "harness": req.get("harness") or "", "box": box, "active": True, "since": stamp, "until": "",
-               "note": a.note or req.get("note") or "", "allow": allow, "deny": deny}
+               "note": a.note or req.get("note") or "", "allow": allow, "deny": deny, "skills": skills}
         for p in cfg["participants"]:
             if p["name"] == a.name:
                 aliases = p.get("aliases") or []
@@ -5319,16 +5696,17 @@ def cmd_roster_decide(a):
                 p["aliases"] = aliases
                 return
         cfg["participants"].append(norm_participant(dict(rec, aliases=[], session="")))
-    cfg = mb.edit_config(me["name"], "approve", fn, {"name": a.name, "role": role, "allow": allow, "deny": deny})
-    req.update(status="approved", decided_by=me["name"], decided_at=stamp, role=role)
+    cfg = mb.edit_config(me["name"], "approve", fn, {"name": a.name, "role": role, "allow": allow, "deny": deny,
+                                                     "skills": skills})
+    req.update(status="approved", decided_by=me["name"], decided_at=stamp, role=role, skills_approved=skills)
     with FileLock(mb.p("locks", "requests.lock")):
         atomic_write(path, dump_json(req))
     p = mb.get(a.name)
-    notify_system(mb, [a.name], "joined", "%s 批准你以%s身份加入；收件箱 %s%s。先看来信（inbox）和通知，再按主控登记开工。" % (
-        me["name"], ROLE_ZH.get(role), "、".join(mb.boxes_of(p)) or "-",
+    notify_system(mb, [a.name], "joined", "%s 批准你以%s身份加入；收件箱 %s；技能 %s%s。先看来信（inbox）和通知，再按主控登记开工。" % (
+        me["name"], ROLE_ZH.get(role), "、".join(mb.boxes_of(p)) or "-", skills_text(skills),
         ("；额外授予 " + "、".join(allow)) if allow else ""), me["name"], "加入已批准")
-    emit("已批准 %s 以%s身份加入（收件箱 %s）%s；在任助手 %d/%d" % (
-        a.name, ROLE_ZH.get(role), box or "-", ("，授予 " + "、".join(allow)) if allow else "",
+    emit("已批准 %s 以%s身份加入（收件箱 %s，技能 %s）%s；在任助手 %d/%d" % (
+        a.name, ROLE_ZH.get(role), box or "-", skills_text(skills), ("，授予 " + "、".join(allow)) if allow else "",
         len([x for x in cfg["participants"] if x["role"] == "assistant" and x["active"]]), cfg["max_assistants"]))
     return 0
 
@@ -5778,6 +6156,14 @@ def cmd_selftest(a):
     c3, o3, e3 = run("notify", "list", "--as", "helper-c", "--json")
     ok(c == 0 and c2 == 0 and any(x["kind"] == "job-done" for x in json.loads(o3)["items"]),
        "队列：投放、领取、完成，结果通知回投放者", e or e2 or e3)
+    run("roster", "skills", "helper-a", "--as", "helper-c", "--set", "python")
+    run("queue", "push", "review", "--as", "helper-c", "--title", "要 rust", "--needs", "rust")
+    c, o, e = run("queue", "take", "review", "--as", "helper-a", "--json")
+    run("queue", "push", "review", "--as", "helper-c", "--title", "要 python", "--needs", "python")
+    c2, o2, e2 = run("queue", "take", "review", "--as", "helper-a", "--json")
+    ok(c == 3 and json.loads(o).get("why", {}).get("缺技能") == 1 and c2 == 0 and json.loads(o2)["title"] == "要 python",
+       "任务按技能分派：缺技能的领不到，能做的照常领取", e or e2 or o)
+    run("queue", "done", "review", str(json.loads(o2)["id"]) if c2 == 0 else "0", "--as", "helper-a", "--text", "好了")
     run("perm", "reset", "helper-a", "--as", "helper-c")
     run("roster", "policy", "--as", "helper-c", "--talk-max-turns", "2", "--talk-burst", "off")
     c, o, e = run("talk", "call", "helper-d", "--as", "helper-a", "--text", "一", "--wait", "0", "--json")
@@ -5901,6 +6287,8 @@ def build_parser():
     r.add_argument("--box", default="", help="收件箱（默认用名字；多方可共用一箱，靠标题点名区分）")
     r.add_argument("--alias", action="append")
     r.add_argument("--note", default="")
+    r.add_argument("--skills", default=None, help="技能标签（逗号分隔），工作队列按它判断谁能接哪个任务")
+    r.add_argument("--max-jobs", type=int, default=None, help="同时最多领几个任务（默认 1，0 表示不限）")
     r.set_defaults(func=cmd_roster_add)
     r = rs.add_parser("update", parents=[common], help="改参与方信息（本人可改 model/harness/session/note）")
     r.add_argument("name")
@@ -5909,7 +6297,17 @@ def build_parser():
     r.add_argument("--alias-add", action="append")
     r.add_argument("--alias-remove", action="append")
     r.add_argument("--activate", choices=("assistant", "observer"), help="让前任重新在任")
+    r.add_argument("--skills", default=None, help="直接设技能标签（主控、用户或 roster.admin；本人申报用 roster skills）")
+    r.add_argument("--max-jobs", type=int, default=None, help="同时最多领几个任务（0 表示不限；主控、用户或 roster.admin）")
+    r.add_argument("--auto-take", default=None, help="空闲时自动接哪些队列的任务（逗号分隔，* 表示全部，off 关闭；本人可改）")
     r.set_defaults(func=cmd_roster_update)
+    r = rs.add_parser("skills", parents=[common], help="技能：查看；本人申报（--set），主控批准（--approve）或驳回（--reject），主控也可直接设")
+    r.add_argument("name", nargs="?")
+    r.add_argument("--set", default=None, help="技能标签（逗号分隔；空串表示清空）")
+    r.add_argument("--approve", action="store_true", help="批准待批的申报")
+    r.add_argument("--reject", action="store_true", help="驳回待批的申报")
+    r.add_argument("--reason", default="", help="驳回理由")
+    r.set_defaults(func=cmd_roster_skills)
     r = rs.add_parser("remove", parents=[common], help="移除助手（改为前任，历史保留）")
     r.add_argument("name")
     r.add_argument("--note", default="")
@@ -5933,6 +6331,7 @@ def build_parser():
     r.add_argument("--allow", action="append", help="额外授予的权限（可逗号分隔）")
     r.add_argument("--deny", action="append", help="收回的权限（可逗号分隔）")
     r.add_argument("--note", default="")
+    r.add_argument("--skills", default=None, help="批准时确认或改写申报的技能（逗号分隔；默认照申请）")
     r.set_defaults(func=cmd_roster_decide, op="approve")
     r = rs.add_parser("reject", parents=[common], help="拒绝加入申请")
     r.add_argument("name")
@@ -5945,6 +6344,7 @@ def build_parser():
     r.add_argument("--talk-max-turns", type=int, help="新建通话最多几条发言，到了自动暂停（0 表示不限；默认 %d）" % TALK_TURNS_DEFAULT)
     r.add_argument("--talk-burst", help="新建通话里两方快速来回到「条数/秒数」就自动暂停，如 20/300；off 关闭（默认 %s）"
                    % TALK_BURST_DEFAULT)
+    r.add_argument("--max-jobs", type=int, help="每人同时最多领几个任务（默认 1，0 表示不限；本人设了 max_jobs 的以本人为准）")
     r.set_defaults(func=cmd_roster_policy)
 
     s = sp("perm", "权限：查看；授予、收回、重置、改角色预设、发身份令牌（只有主控或用户能改）")
@@ -6188,21 +6588,31 @@ def build_parser():
     text_opts(r, "任务内容（最多 16 KB）")
     r.add_argument("--priority", type=int, default=0, help="越大越先领")
     r.add_argument("--to", help="指派给某人（只有他能领）")
+    r.add_argument("--needs", default=None, help="所需技能（逗号分隔）：只有全部具备的人能领")
+    r.add_argument("--prefers", default=None, help="加分技能（逗号分隔）：同优先级里具备得多的人先领到")
     r.add_argument("--wait", type=float, default=0, help="等任务结束的秒数")
     r.set_defaults(func=cmd_queue_push)
-    r = qs.add_parser("take", parents=[common], help="领下一个任务（queue.take）；--wait 时排队等")
+    r = qs.add_parser("take", parents=[common], help="领一个任务（queue.take）：默认领你能领的里面排最前的；--wait 时排队等")
     r.add_argument("name")
+    r.add_argument("--job", type=int, default=None, help="领指定的这一个")
     r.add_argument("--wait", type=float, default=0)
     r.set_defaults(func=cmd_queue_take)
     for op, help_ in (("done", "完成（--text 写结果）"), ("fail", "记为失败（--retry 还有次数就放回重试）"),
                       ("release", "做不了，放回排队（不算一次尝试）"), ("renew", "续租"),
-                      ("cancel", "取消（投放者或 queue.admin）")):
+                      ("cancel", "取消（投放者或 queue.admin）"),
+                      ("decline", "不适合我：放回排队（不算一次尝试），以后不再分给我；没领的也可以先拒绝"),
+                      ("progress", "报进度（--pct、--text），顺带续租；投放者收到通知（同一任务 5 分钟内最多一次）"),
+                      ("block", "卡住了：写明卡在哪，通知主控与投放者，租约暂停"),
+                      ("unblock", "解除卡住（领取方、投放者或 queue.admin），租约重新计时")):
         r = qs.add_parser(op, parents=[common], help=help_)
         r.add_argument("name")
         r.add_argument("job", type=int)
-        text_opts(r, "结果" if op == "done" else "说明")
+        text_opts(r, {"done": "结果", "decline": "拒绝的原因", "progress": "进度说明", "block": "卡住的原因",
+                      "unblock": "答复"}.get(op, "说明"))
         if op == "fail":
             r.add_argument("--retry", action="store_true")
+        if op == "progress":
+            r.add_argument("--pct", type=int, default=None, help="完成百分比 0–100")
         r.set_defaults(func=cmd_queue_act, op=op)
     r = qs.add_parser("show", parents=[common], help="队列里的任务")
     r.add_argument("name")
@@ -6223,6 +6633,7 @@ def build_parser():
     s.add_argument("--harness", default="")
     s.add_argument("--display", default="")
     s.add_argument("--note", default="", help="附言：你是谁、能做什么")
+    s.add_argument("--skills", default=None, help="申报技能标签（逗号分隔），主控批准时确认")
     s.add_argument("--role", choices=("assistant", "observer"), default="assistant")
     s.add_argument("--wait", type=float, default=0, help="等批准的秒数")
     s.add_argument("--status", action="store_true", help="只查申请状态")

@@ -126,11 +126,12 @@ to-<箱>-<线程>-<KEY>-STATUS.json        KEY：大写字母数字，可用 - �
 | `policy.inactive_send` | 不在任者能否发信 | `deny` |
 | `policy.talk_max_turns` | 新建通话最多几条发言，到了自动暂停；0 不限（见第 12 节） | 40 |
 | `policy.talk_burst` | 新建通话里两方快速来回到「条数/秒数」就自动暂停；`off` 关闭 | `20/300` |
+| `policy.max_jobs` | 每人同时最多领几个任务（本人设了 `max_jobs` 的以本人为准）；0 不限 | 1 |
 | `quotas` | 配额：`{"<参与方名或 @assistants、@observers>": {"talk": "60/h", ...}}`（见第 12 节） | 无 |
 | `secret_patterns` | 追加的凭据正则 | `[]` |
 | `presets` | 角色预设的整体改写：`{"assistant": [...], "observer": [...]}`（见第 10 节） | 无（由通信策略推出） |
 | `user_token_sha256` | `--as user` 的身份令牌哈希 | 无 |
-| `participants[]` | 参与方：`name`、`role`（controller / assistant / former / observer）、`display`、`model`、`harness`、`session`、`box`、`aliases`、`active`、`since`、`until`、`note`；`allow`、`deny`（主控的显式授予、收回）；`token_sha256`（身份令牌哈希） | |
+| `participants[]` | 参与方：`name`、`role`（controller / assistant / former / observer）、`display`、`model`、`harness`、`session`、`box`、`aliases`、`active`、`since`、`until`、`note`；`allow`、`deny`（主控的显式授予、收回）；`token_sha256`（身份令牌哈希）；`skills`（技能标签）、`skills_proposed`（本人申报、待批的技能）、`max_jobs`（同时最多领几个任务）、`auto_take`（空闲时自动接哪些队列的任务，`*` 表示全部） | |
 
 校验（不通过就拒绝写入）：恰有一名在任主控；在任助手不超过上限且都有收件箱；名字和别名在在任者之间不重复；个人箱不能与主控箱、广播箱同名。
 
@@ -220,7 +221,8 @@ to-<箱>-<线程>-<KEY>-STATUS.json        KEY：大写字母数字，可用 - �
   - `job`、`job-done`、`job-failed`：派活、领取、取消，任务完成，任务失败；
   - `perm`：权限或配额变更；
   - `join`、`joined`：加入申请，加入已批准；
-  - `talk-paused`：通话自动暂停（发给主控）；`quota`：谁的配额用完了（发给主控，每个窗口一次）。
+  - `talk-paused`：通话自动暂停（发给主控）；`quota`：谁的配额用完了（发给主控，每个窗口一次）；
+  - `job-progress`、`job-blocked`、`job-unclaimed`：任务进度、任务卡住、任务没人能接；`skills`：技能申报、批准与变更。
 - 文字最多 4 KB，经卫生检查与凭据拦截。
 - 收件人游标里的 `notify_seen` 是已看序号：MCP 送达、命令行 `watch` 报出、`notify list` 列出，都把它往前推。
 - 归档：追加之后若通知流超过 512 KB，在同一把锁里把旧条目移到 `<名>.archive.jsonl`。
@@ -241,15 +243,24 @@ to-<箱>-<线程>-<KEY>-STATUS.json        KEY：大写字母数字，可用 - �
 
 工作队列 `queues/<队列>.json`：
 - 设置：`lease_seconds`（默认 900）、`max_attempts`（默认 3）、`consumers`（领取名单，空为不限）、`notify`（新任务是否通知可领的人）。
-- 任务 `jobs[]`：`id`、`title`、`body`、`from`、`priority`、`to`（指派）、`status`（pending / claimed / done / failed / cancelled）、`attempts`、`claimed_by`、`lease_until`、`result`、`error`、`log`。
-- 领取顺序：
-  - 优先级高的先；
-  - 同优先级里指派给自己的先；
-  - 再按 `id`；
-  - 指派给别人的领不到。
+- 任务 `jobs[]`：`id`、`title`、`body`、`from`、`priority`、`to`（指派）、`status`（pending / claimed / blocked / done / failed / cancelled）、`attempts`、`claimed_by`、`lease_until`、`result`、`error`、`log`。
+  1.3 起另有 `needs`（所需技能）、`prefers`（加分技能）、`progress`（`pct`、`text`、`at`、`by`）、`blocked`（`at`、`by`、`reason`）、`declined`（`[{who, reason, at}]`）。
+- 谁能领（全部满足）：任务在排队；没指派给别人；在领取名单里（若设了）；有 `queue.take`；具备 `needs` 里的全部技能；没拒绝过这个任务；手上在做的任务（跨全部队列、已领未卡住的）少于本人的 `max_jobs`（没设就看 `policy.max_jobs`）。主控与用户不看技能和上限。
+- 领取顺序：优先级高的先；同优先级里指派给自己的先；再看 `prefers` 命中本人技能多的；最后按 `id`。`take --job N` 领指定的那一个，领不了就报原因；领不到时返回各个排队任务领不了的原因与个数。
 - 领取时 `attempts` 加一。租约到期时还有次数就放回排队，否则判失败并通知投放者。`release` 放回且不算一次尝试，`fail --retry` 还有次数就放回排队。
+- `decline`：领了又不适合，放回排队且不算一次尝试，并记进 `declined`，以后不再分给他；没领的也可以先拒绝。能接的人都拒绝了，就通知主控（`job-unclaimed`）。
+- `progress`：记进度并顺带续租；投放者收到 `job-progress`，同一任务 5 分钟内最多一次。
+- `block`：转为 blocked，租约暂停（`lease_until` 清空），通知投放者与主控（`job-blocked`）。`unblock` 由领取方、投放者或有 `queue.admin` 的人做，回到 claimed 并重新计租约。卡住的任务也能 `done`、`fail`、`release`、`decline`。
+- 新任务只通知能接的人：先找手上有空的，都忙就通知所有能接的；没人能接就通知主控（`job-unclaimed`），投放结果里也写明能接的人。
+- 队列文件只在真有改动时重写：空领一次不会改写文件、惊动别的等待方。
 - 已结束的任务保留最近 100 个，更早的移到 `<队列>.archive.jsonl`。
 - 排队中的任务最多 500 个；内容与结果各最多 16 KB。
+
+技能：
+- 标签写法：小写字母或数字开头，可含 `. + # _ -`，最长 32 个字符，每人最多 32 个。
+- 申请加入时 `join --skills` 申报，主控 `roster approve --skills` 确认或改写。已在任的人用 `roster skills <本人> --set` 申报，记进 `skills_proposed`，主控 `--approve` 采纳、`--reject` 驳回；主控、用户或有 `roster.admin` 的人也可直接 `--set`。
+- 本人可以改自己的 `auto_take`；`max_jobs` 由主控、用户或有 `roster.admin` 的人设。
+- 自动接单只在 MCP 服务里生效：模型调 `mailbox_wait`（空闲）且手上的任务少于上限时，服务按上面的规则替本方领最合适的一个，连同同时到的事件一起交出；这次回应没送到（调用被取消、发送失败）就把任务放回排队。
 
 加入申请 `requests/<名>.json`：
 - 字段：`{"name", "model", "harness", "display", "note", "role", "at", "status": "pending|approved|rejected", "decided_by", "decided_at", "reason"}`。

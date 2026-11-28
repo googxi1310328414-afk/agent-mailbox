@@ -38,6 +38,7 @@ python -I -B <skill>/scripts/mcp_server.py --mailbox <信箱目录> --as <本方
 | `--init` | 关 | 信箱还没初始化时，以本方为主控初始化（目录不存在就建） |
 | `--join`、`--join-role` | 关、`assistant` | 本方不在花名册里（或已不在任）时申请加入，等主控批准 |
 | `--model`、`--harness`、`--note` | 环境变量 `AGENT_MAILBOX_MODEL`、`AGENT_MAILBOX_HARNESS` | `--init`、`--join` 时登记的模型、宿主与附言 |
+| `--skills` | 环境变量 `AGENT_MAILBOX_SKILLS` | `--join` 时申报的技能标签（逗号分隔），主控批准时确认 |
 | `--token-file` | 无 | 身份令牌文件；也可设环境变量 `AGENT_MAILBOX_TOKEN`（优先） |
 | `--tools` | `auto`（或环境变量 `AGENT_MAILBOX_TOOLS`） | 工具清单：`auto` 按本方权限只列能用的工具和动作；`all` 全部列出、不随权限变；`core` 只列常用的 8 个；也可写逗号分隔的工具名（可省去 `mailbox_` 前缀），见下文「工具清单随身份变化」 |
 | `--version` | — | 打印版本号后退出，不起服务；输出与 `agent-mailbox --version` 相同 |
@@ -107,9 +108,9 @@ tool_timeout_sec = 600
 | `mailbox_call` | 呼叫另一个模型并等它回复：沿用一对一通话（或用 `conv` 指定通话），等到回复、通话结束或暂停、超时 |
 | `mailbox_talk` | 通话：`start`、`say`、`read`、`list`、`queue`（来电队列）、`next`（接下一个来电）、`invite`、`leave`、`close`；`pause`、`resume`（暂停、继续或改发言上限）只有主控和用户能做 |
 | `mailbox_notify` | 通知：`send` 发轻量提醒，`list` 看本方通知 |
-| `mailbox_queue` | 工作队列：`create`、`push`、`take`（可排队等）、`done`、`fail`、`release`、`renew`、`cancel`、`show`、`job`、`wait`、`list` |
+| `mailbox_queue` | 工作队列：`create`、`push`（可带 `needs`、`prefers`）、`take`（可带 `job`，可排队等）、`progress`、`done`、`block`、`unblock`、`decline`、`fail`、`release`、`renew`、`cancel`、`show`、`job`、`wait`、`list` |
 | `mailbox_perm` | 权限与配额：`list`、`show`、`check`；`grant`、`revoke`、`reset`、`preset`、`quota` 只有主控能做 |
-| `mailbox_roster` | 花名册：查看；增减助手、上限、加入申请（`requests`、`approve`、`reject`）由主控或 `roster.admin` 做；交接、策略（含 `talk_max_turns`、`talk_burst`）只有主控能做 |
+| `mailbox_roster` | 花名册：查看；`skills` 本人申报技能、主控批准或驳回；增减助手、上限、加入申请（`requests`、`approve`、`reject`）由主控或 `roster.admin` 做；交接、策略（含 `talk_max_turns`、`talk_burst`、`max_jobs`）只有主控能做 |
 | `mailbox_who` | 各参与方在线与进度（含通话未读、通知未看） |
 | `mailbox_doctor` | 只读体检 |
 | `mailbox_template` | 信件模板 |
@@ -125,7 +126,7 @@ tool_timeout_sec = 600
 - 清单只是展示：参数校验仍按完整定义，没刷新清单的客户端照样能调；能不能做由权限判定，清单里没列的动作调了也只会得到「权限不足」。
 - 申请加入还没批准时，只列批准前能用的工具。
 
-实测（粗估 token 数，只算名字、说明和参数定义；服务说明另有 700–800）：主控约 5000，助手约 4000，旁听者约 2900，`--tools core` 约 1900；1.2 时每人都是约 5400。
+实测（粗估 token 数，只算名字、说明和参数定义；服务说明另有 700–800）：主控约 5400（多了暂停、配额、任务领取等动作，与 1.2 持平），助手约 4300，旁听者约 3100，`--tools core` 约 1900；1.2 时每人都是约 5400。
 不认识 `tools/list_changed` 的客户端，可以用 `--tools all` 固定列出全部。
 
 ## 通话、队列与阻塞等待
@@ -138,6 +139,19 @@ tool_timeout_sec = 600
 - `mailbox_talk` 的 `start`、`say` 也能带 `wait_seconds` 等回复；`next` 带 `wait_seconds` 时排队等来电。
 - `mailbox_queue` 的 `take` 带 `wait_seconds` 时排队等活：队列文件变了才去领，至少每 10 秒试一次（租约可能悄悄到期）。`push` 带 `wait_seconds`、`wait` 动作都等任务结束拿结果。
 - 客户端工具超时较短时（例如 Codex 未配置 `tool_timeout_sec`），把等待秒数设得比它短；等不到就再调一次，不会丢东西。
+
+### 任务领取与自动接单
+
+主控投任务不必指定人：写清所需技能（`needs`）和加分技能（`prefers`），由系统挑能接的人、按顺序分派。
+- **谁能领**：有领取权限、具备全部所需技能、没拒绝过这个任务、手上在做的少于上限（默认 1 个，主控用 `mailbox_roster policy` 的 `max_jobs` 改默认，或给某人单独设）。
+- **顺序**：优先级高的先；同优先级里指派给自己的先；再看加分技能命中多的；最后先来先到。`take` 可带 `job` 领指定的那一个；领不到时结果里有各个排队任务领不了的原因（缺技能、手上已满、拒绝过……）。
+- **只通知能接的人**：先找手上有空的，都忙就通知所有能接的；没人能接时通知主控，投放结果里也写明能接的人。
+- **做的过程中**：
+  - `progress` 报进度，顺带续租；投放者收到通知，同一任务 5 分钟内最多一次。
+  - `block` 写明卡在哪，租约暂停，主控和投放者收到通知；处理好后由主控、投放者或领取方 `unblock`。
+  - 不适合自己就 `decline` 并写明原因：任务放回排队，以后不再分给你；能接的人都拒绝了，主控会收到通知。
+- **技能**：申请加入时用 `--skills` 申报，主控 `approve` 时确认或改写（`skills` 参数）。已在任的用 `mailbox_roster skills` 申报，主控 `verdict: approve` 或 `reject`。
+- **自动接单**：用 `mailbox_roster update` 把 `auto_take` 设为队列名（`["*"]` 表示全部队列）。之后调 `mailbox_wait` 空闲等待、手上又没满时，服务直接替你领最合适的任务，作为【自动接单】交出，同时到的事件附在后面。这次回应没送到（调用被取消、发送失败）就自动放回排队。领到的任务照常 `progress`、`done`；不适合就 `decline`。
 
 ### 通话上限、暂停与配额
 

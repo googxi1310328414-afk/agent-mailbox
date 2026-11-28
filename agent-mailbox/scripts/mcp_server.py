@@ -160,19 +160,28 @@ TOOL_SPECS = [
         ("limit", I("list：最多几条"), None), ("peek", B("list：不记为已看"), None)],
          actions=[("send", "发一条", "notify", ("to", "text", "title", "urgent")),
                   ("list", "看本方通知（默认只列没看过的）", None, ("all", "limit", "peek"))]),
-    tool("mailbox_queue", "工作队列：任务按优先级排队，领到的有租约，到期没完成就放回排队；几个模型同时领也不会领到同一个。", [
-        ("queue", S("队列名：小写字母数字，可用 - 连接"), None), ("job", I("任务号"), None), ("title", S("任务标题"), None),
-        ("text", S("push 时是任务内容，done 时是结果，其余是说明"), None), ("priority", I("优先级，越大越先领"), None),
-        ("to", S("指派给谁（只有他能领）"), None), ("retry", B("还有尝试次数就放回排队"), None),
+    tool("mailbox_queue", "工作队列：任务按优先级排队，只有具备所需技能、手上没满的人能领；领到的有租约，到期没完成就放回排队；"
+                          "几个模型同时领也不会领到同一个。", [
+        ("queue", S("队列名：小写字母数字，可用 - 连接"), None), ("job", I("任务号（take 时可选：领指定的这一个）"), None),
+        ("title", S("任务标题"), None),
+        ("text", S("push 时是任务内容，done 时是结果，decline、block 时是原因，其余是说明"), None),
+        ("priority", I("优先级，越大越先领"), None), ("to", S("指派给谁（只有他能领）"), None),
+        ("needs", SA("push：所需技能，全部具备才能领"), None), ("prefers", SA("push：加分技能"), None),
+        ("pct", I("progress：完成百分比 0–100"), None), ("retry", B("还有尝试次数就放回排队"), None),
         ("wait_seconds", I("push、take、wait 的等待秒数，0–3600"), None), ("all", B("show：列出全部已结束的"), None),
         ("desc", S("队列说明"), None), ("lease_seconds", I("租约秒数"), None), ("max_attempts", I("最多尝试次数"), None),
         ("consumers", SA("领取名单（空数组表示不限）"), None), ("notify", B("新任务是否通知可领的人"), None)],
          ann=WRITE,
          actions=[("list", "全部队列", None, ()),
                   ("create", "建队列或改设置", "queue.admin", ("queue", "desc", "lease_seconds", "max_attempts", "consumers", "notify")),
-                  ("push", "投任务（可等结果）", "queue.push", ("queue", "title", "text", "priority", "to", "wait_seconds")),
-                  ("take", "领下一个（可排队等）", "queue.take", ("queue", "wait_seconds")),
+                  ("push", "投任务（可等结果）", "queue.push", ("queue", "title", "text", "priority", "to", "needs", "prefers",
+                                                          "wait_seconds")),
+                  ("take", "领你能领的里面排最前的（可排队等）", "queue.take", ("queue", "job", "wait_seconds")),
+                  ("progress", "报进度并续租", "queue.take", ("queue", "job", "pct", "text")),
                   ("done", "交结果", "queue.take", ("queue", "job", "text")),
+                  ("block", "卡住了，等主控处理", "queue.take", ("queue", "job", "text")),
+                  ("unblock", "解除卡住", ("queue.take", "queue.push", "queue.admin"), ("queue", "job", "text")),
+                  ("decline", "不适合我：放回，以后不再分给我", "queue.take", ("queue", "job", "text")),
                   ("fail", "记为失败", "queue.take", ("queue", "job", "text", "retry")),
                   ("release", "放回排队", "queue.take", ("queue", "job", "text")),
                   ("renew", "续租", "queue.take", ("queue", "job")),
@@ -202,17 +211,25 @@ TOOL_SPECS = [
         ("assistant_to_assistant", E(("allow", "cc-controller", "deny"), "助手之间能否直接通信"), None),
         ("broadcast", E(("controller", "anyone"), "谁能广播"), None), ("inactive_send", E(("deny", "allow"), "不在任者能否发信"), None),
         ("talk_max_turns", I("新建通话最多几条发言，到了自动暂停（0 不限）"), None),
-        ("talk_burst", S("两方快速来回到「条数/秒数」就自动暂停，如 20/300；off 关闭"), None)],
+        ("talk_burst", S("两方快速来回到「条数/秒数」就自动暂停，如 20/300；off 关闭"), None),
+        ("skills", SA("技能标签：skills 时是本人申报（主控直接设），approve、add 时是确认的技能"), None),
+        ("verdict", E(("approve", "reject"), "skills：批准或驳回待批的申报"), "admin"),
+        ("max_jobs", I("同时最多领几个任务（0 不限）"), "admin"),
+        ("auto_take", SA("空闲时自动接哪些队列的任务（[\"*\"] 表示全部，空数组关闭）"), None)],
          actions=[("show", "查看", None, ()),
-                  ("update", "改资料（本人可改自己的 model、harness、session、note）", None,
-                   ("name", "model", "harness", "session", "display", "box", "aliases", "alias_remove", "note", "activate")),
-                  ("add", "加人", "admin", ("name", "role", "model", "harness", "session", "display", "box", "aliases", "note")),
+                  ("update", "改资料（本人可改自己的 model、harness、session、note、auto_take）", None,
+                   ("name", "model", "harness", "session", "display", "box", "aliases", "alias_remove", "note", "activate",
+                    "max_jobs", "auto_take")),
+                  ("skills", "技能：查看；本人申报，主控批准或驳回", None, ("name", "skills", "verdict", "reason")),
+                  ("add", "加人", "admin", ("name", "role", "model", "harness", "session", "display", "box", "aliases", "note",
+                                           "skills", "max_jobs")),
                   ("remove", "移除", "admin", ("name",)), ("limit", "在任助手上限", "admin", ("n",)),
-                  ("requests", "待批的加入申请", "admin", ("all",)), ("approve", "批准加入", "admin", ("name", "role", "allow", "deny")),
+                  ("requests", "待批的加入申请", "admin", ("all",)),
+                  ("approve", "批准加入（可确认或改写申报的技能）", "admin", ("name", "role", "allow", "deny", "skills")),
                   ("reject", "拒绝加入", "admin", ("name", "reason")),
                   ("handover", "交接主控", "boss", ("name", "old_role", "old_box", "no_inherit")),
-                  ("policy", "通信策略与通话上限", "boss", ("assistant_to_assistant", "broadcast", "inactive_send",
-                                                            "talk_max_turns", "talk_burst"))]),
+                  ("policy", "通信策略、通话上限、每人同时最多领几个任务", "boss", (
+                      "assistant_to_assistant", "broadcast", "inactive_send", "talk_max_turns", "talk_burst", "max_jobs"))]),
     tool("mailbox_who", "在线与进度：谁在监视、未读数、上次发信、未完成任务、在等什么。", ann=RO),
     tool("mailbox_doctor", "只读体检：花名册、命名、同号多信、CR 与损坏字、残留锁、投递后被改动的信。",
          [("all_threads", B("体检目录里全部线程"), None)], ann=RO),
@@ -434,7 +451,8 @@ class Server(object):
         self.join_sent = False  # 以后若被移除，再次申请
         return {"ok": True, "name": me["name"], "role": me["role"], "display": me["display"], "model": me["model"],
                 "harness": me["harness"], "inbox": me["inbox"], "active": me["active"], "thread": ro["thread"],
-                "controller": ctrl}
+                "controller": ctrl, "skills": me.get("skills") or [], "skills_proposed": me.get("skills_proposed"),
+                "max_jobs": me.get("max_jobs", 1), "auto_take": me.get("auto_take") or []}
 
     def join_state(self, ctrl):
         """--join：花名册里还没有本方（或已不在任）时提交加入申请，之后只查申请状态。"""
@@ -444,6 +462,8 @@ class Server(object):
             args = ["join", opt("model", self.o.model or ""), opt("harness", self.o.harness or ""), opt("role", self.o.join_role)]
             if self.o.note:
                 args.append(opt("note", self.o.note))
+            if self.o.skills:
+                args.append(opt("skills", self.o.skills))
             code, out, err = core.run_cli(self.base + args)
             if code != 0:
                 return {"ok": False, "problem": "申请加入失败：%s" % ((err or out).strip().split("\n")[0])}
@@ -605,6 +625,7 @@ class Server(object):
                 for ctx in pending:
                     self.uncommit(ctx.get("delivery"))
                     self.rollback(ctx.get("delivery"))
+                    self.undo_auto_take(ctx)
 
     def process(self, m, cancel):
         rid, method = m["id"], m["method"]
@@ -650,10 +671,17 @@ class Server(object):
             result.setdefault("_meta", {})[META_SERVER] = SERVER_INFO
         return {"jsonrpc": "2.0", "id": rid, "result": result}, ctx
 
+    def undo_auto_take(self, ctx):
+        """自动接单的结果没交到模型手里（调用被取消、回应发不出去）：把任务放回排队。"""
+        got = ctx.pop("auto_taken", None)
+        if got:
+            core.run_cli(self.base + ["queue", "release", opt("text", "自动接单的结果没送到模型，放回排队"), "--", got[0], str(got[1])])
+
     def finish(self, resp, ctx, cancel):
         delivery = ctx.get("delivery")
         if resp is None or cancel.is_set():  # 被取消的请求不回应；带着的事件放回去
             self.rollback(delivery)
+            self.undo_auto_take(ctx)
             return
         # 先记送达再发回应：客户端收到回应后马上发来的 mark --unread 不会被晚到的送达记录盖掉
         self.commit(delivery)
@@ -662,6 +690,7 @@ class Server(object):
         except Exception as e:
             self.uncommit(delivery)
             self.rollback(delivery)
+            self.undo_auto_take(ctx)
             self.log("error", {"send": "%s: %s" % (type(e).__name__, e)})
             self.safe_send({"jsonrpc": "2.0", "id": resp.get("id"), "error": {"code": -32603, "message": "Internal error: unencodable response"}})
             return
@@ -813,7 +842,7 @@ class Server(object):
             self.notify_resource("mailbox://talk")
         if "NOTIFY" in kinds:
             self.notify_resource("mailbox://notifications")
-            if any(e.get("notify_kind") in ("perm", "joined") for e in evs):
+            if any(e.get("notify_kind") in ("perm", "joined", "skills") for e in evs):
                 self.identity = self.load_identity()  # 权限或身份变了，whoami 立刻反映
                 self.refresh_tools(force=True)
         self.log("info", {"event": "mailbox", "kinds": sorted(kinds), "count": len(evs)})
@@ -1265,6 +1294,55 @@ class Server(object):
             ("｜" + "；".join(r["notes"])) if r["notes"] else "") for r in d["sent"]]
         return "\n".join(lines), d
 
+    def auto_take(self):
+        """空闲自动接单：本方在花名册里开了 auto_take、手上的任务少于上限时，替本方领一个最合适的任务。
+        先只读地看有没有能领的（空领一次也会改写队列文件、惊动别人），有才真正去领；没开或没有就返回 None。"""
+        if not self.identity.get("ok") or self.o.read_only:
+            return None
+        try:
+            mb = self.ro_mb()
+            key = []  # 花名册和各队列文件都没变就不必重扫；租约可能悄悄到期，所以至少每 10 秒扫一次
+            for path in [mb.config_path] + [core.queue_path(mb, qn) for qn in core.queue_names(mb)]:
+                try:
+                    st = os.stat(path)
+                    key.append((path, st.st_size, st.st_mtime_ns))
+                except OSError:
+                    key.append((path, None, None))
+            last = getattr(self, "auto_last", None)
+            if last and last[0] == key and time.time() - last[1] < 10:
+                return None
+            self.auto_last = (key, time.time())
+            me = mb.identity(self.o.me)  # 每次按最新的花名册：主控改了设置、批准了技能都即时生效
+            if not me.get("auto_take"):
+                return None
+            held = core.jobs_held(mb, me["name"])
+            cap = core.max_jobs_of(me, mb.cfg)
+            if cap and held >= cap:
+                return None
+            names = core.queue_names(mb) if "*" in (me.get("auto_take") or []) else list(me.get("auto_take") or [])
+            best = None
+            for qn in names:
+                try:
+                    q = core.queue_view(mb, qn)
+                except core.CliError:
+                    continue
+                for j in q["jobs"]:
+                    if core.job_misfit(mb, q, j, me, held) is None:
+                        key = core.job_rank(j, me)
+                        if best is None or key < best[0]:
+                            best = (key, qn, j["id"])
+        except core.CliError:
+            return None
+        if best is None:
+            return None
+        code, out, err = core.run_cli(self.base + ["queue", "take", "--json", opt("job", best[2]), "--", best[1]])
+        if code != 0:
+            return None  # 被别人抢先领走、或刚刚变得不合适：下一轮再看
+        try:
+            return json.loads(out)
+        except ValueError:
+            return None
+
     def t_wait(self, a, ctx):
         timeout = clamp_int(a.get("timeout_seconds"), 1, 3600, self.o.wait_default)
         if not self.identity.get("ok") and (self.identity.get("pending") or self.identity.get("rejected")):
@@ -1277,10 +1355,21 @@ class Server(object):
                 return "已取消", {"cancelled": True}
             bell = self.bell_gen  # 先记下门铃再查：查的过程中响了也不会漏
             d = self.collect_delivery()
+            n = (len(d["letters"]) + len(d["talk"]) + len(d["notes"]) + sum(len(b["events"]) for b in d["batches"])) if d else 0
+            j = self.auto_take()  # 新任务的通知往往和任务同时到：先替本方领下，再把同时到的事件一并交出
+            if j:
+                ctx["auto_taken"] = (j.get("queue"), j["id"])  # 回应没送到就放回排队，免得任务被白占着
+                lines = ["【自动接单】你开了 auto_take，空闲时已替你领取：" + self.job_text(j)[0]] + self.job_text(j)[1:]
+                lines.append(self.job_hint(j.get("queue"), j["id"]))
+                data = {"auto_taken": j, "count": 1 + n}
+                if d:
+                    ctx["delivery"] = d
+                    lines += ["", "【同时到的事件】", format_delivery(d, self.fmt_at)]
+                    data.update(delivery_data(d))
+                return "\n".join(lines), data
             if d:
                 ctx["delivery"] = d
-                return format_delivery(d, self.fmt_at), dict(delivery_data(d), count=len(d["letters"]) + len(d["talk"]) + len(d["notes"]) + sum(
-                    len(b["events"]) for b in d["batches"]))
+                return format_delivery(d, self.fmt_at), dict(delivery_data(d), count=n)
             now = time.time()
             if now >= deadline:
                 return "超时：%d 秒内没有新事件（可再调 mailbox_wait）" % timeout, {"timeout": True}
@@ -1427,8 +1516,28 @@ class Server(object):
                 lines.append("  %s｜%s / %s｜申请%s｜%s｜%s%s" % (
                     r.get("name"), r.get("model") or "-", r.get("harness") or "-", core.ROLE_ZH.get(r.get("role"), r.get("role")),
                     self.fmt_at(r.get("at")), {"pending": "待批", "approved": "已批", "rejected": "已拒"}.get(r.get("status"), "?"),
-                    ("｜附言：" + r["note"]) if r.get("note") else ""))
+                    ("｜附言：" + r["note"]) if r.get("note") else "") + (
+                    ("｜申报技能 " + "、".join(r["skills"])) if r.get("skills") else ""))
             return "\n".join(lines), d
+        if act == "skills":
+            args = ["roster", "skills"] + ([safe_positional(a["name"], "name")] if a.get("name") else [])
+            if a.get("skills") is not None:
+                args.append(opt("set", ",".join(a["skills"])))
+            if a.get("verdict"):
+                args.append("--" + a["verdict"])
+                if a.get("reason"):
+                    args.append(opt("reason", a["reason"]))
+            if a.get("skills") is None and not a.get("verdict"):
+                d = self.cli(*(args + ["--json"]), as_json=True)
+                lines = ["%s：技能 %s%s｜%s%s" % (
+                    r["name"], "、".join(r["skills"]) or "（无）",
+                    ("｜申报中：" + ("、".join(r["proposed"]) or "清空")) if r.get("proposed") is not None else "",
+                    core.jobs_cap_text(r["max_jobs"]), ("｜自动接单 " + "、".join(r["auto_take"])) if r["auto_take"] else "")
+                    for r in d["participants"]]
+                return "\n".join(lines), d
+            out = self.cli(*args).strip()
+            self.identity = self.load_identity()
+            return out, None
         args = ["roster", act]
         if act in ("add", "update", "remove", "handover", "approve", "reject") and not a.get("name"):
             raise ToolError("%s 需要 name" % act)
@@ -1438,6 +1547,10 @@ class Server(object):
                 if a.get(k):
                     args.append(opt(k, a[k]))
             args += [opt("alias", x) for x in a.get("aliases") or []]
+            if a.get("skills") is not None:
+                args.append(opt("skills", ",".join(a["skills"])))
+            if a.get("max_jobs") is not None:
+                args.append(opt("max-jobs", a["max_jobs"]))
         elif act == "update":
             for k in ("model", "harness", "session", "display", "box", "note"):
                 if a.get(k) is not None:
@@ -1446,6 +1559,10 @@ class Server(object):
             args += [opt("alias-remove", x) for x in a.get("alias_remove") or []]
             if a.get("activate"):
                 args.append(opt("activate", a["activate"]))
+            if a.get("max_jobs") is not None:
+                args.append(opt("max-jobs", a["max_jobs"]))
+            if a.get("auto_take") is not None:
+                args.append(opt("auto-take", ",".join(a["auto_take"]) or "off"))
         elif act == "remove":
             if a.get("note"):
                 args.append(opt("note", a["note"]))
@@ -1465,11 +1582,15 @@ class Server(object):
                     args.append(opt(k.replace("_", "-"), a[k]))
             if a.get("talk_max_turns") is not None:
                 args.append(opt("talk-max-turns", a["talk_max_turns"]))
+            if a.get("max_jobs") is not None:
+                args.append(opt("max-jobs", a["max_jobs"]))
         elif act == "approve":
             for k in ("role", "box", "note"):
                 if a.get(k):
                     args.append(opt(k, a[k]))
             args += [opt("allow", x) for x in a.get("allow") or []] + [opt("deny", x) for x in a.get("deny") or []]
+            if a.get("skills") is not None:
+                args.append(opt("skills", ",".join(a["skills"])))
         elif act == "reject":
             if a.get("reason"):
                 args.append(opt("reason", a["reason"]))
@@ -1718,18 +1839,31 @@ class Server(object):
             lines.append("  （没有%s）" % ("通知" if a.get("all") else "未看的通知"))
         return "\n".join(lines), d
 
+    @staticmethod
+    def job_hint(name, jid):
+        return ("做完调 mailbox_queue done（queue=%s, job=%d, text=结果）；做得久就 progress 报进度（顺带续租）；卡住了 block；"
+                "不适合你就 decline 并写明原因（以后不再分给你）；做不了也可以 release。" % (name, jid))
+
     def job_text(self, j, full=True):
-        st = {"pending": "排队", "claimed": "已领", "done": "完成", "failed": "失败", "cancelled": "已取消"}.get(j["status"], j["status"])
+        st = core.JOB_ZH.get(j["status"], j["status"])
+        pg = j.get("progress") or {}
         if j["status"] == "pending" and j.get("position"):
             st += "，第 %d 位" % j["position"]
         elif j["status"] == "claimed":
-            st += "：%s，租约到 %s" % (j.get("claimed_by"), self.fmt_at(j.get("lease_until")))
+            st += "：%s，租约到 %s%s" % (j.get("claimed_by"), self.fmt_at(j.get("lease_until")),
+                                     ("，进度 %d%%" % pg["pct"]) if pg.get("pct") is not None else "")
+        elif j["status"] == "blocked":
+            st += "：%s，%s" % (j.get("claimed_by"), (j.get("blocked") or {}).get("reason") or "")
         elif j.get("finished_by"):
             st += "：%s" % j["finished_by"]
-        lines = ["队列 %s 任务 #%d [%s]「%s」｜%s 投于 %s%s%s%s" % (
+        lines = ["队列 %s 任务 #%d [%s]「%s」｜%s 投于 %s%s%s%s%s%s" % (
             j.get("queue"), j["id"], st, j.get("title"), j.get("from"), self.fmt_at(j.get("at")),
             ("｜优先级 %d" % j["priority"]) if j.get("priority") else "", ("｜指派 " + j["to"]) if j.get("to") else "",
+            ("｜需要 " + "、".join(j["needs"])) if j.get("needs") else "",
+            ("｜拒绝过：" + "、".join(d["who"] for d in j["declined"])) if j.get("declined") else "",
             ("｜" + j["error"]) if j.get("error") else "")]
+        if full and pg.get("text"):
+            lines.append("进度：%s" % pg["text"])
         if full and j.get("body"):
             lines += ["内容："] + ["  " + l for l in j["body"].split("\n")]
         if full and j.get("result"):
@@ -1755,12 +1889,13 @@ class Server(object):
             d = self.cli("queue", "list", "--json", as_json=True)
             lines = ["队列 %d 个" % len(d["queues"])]
             for r in d["queues"]:
-                lines.append("  %s%s｜排队 %s，已领 %s，完成 %s，失败 %s" % (
+                lines.append("  %s%s｜排队 %s，已领 %s%s，完成 %s，失败 %s" % (
                     r["name"], ("（%s）" % r["desc"]) if r.get("desc") else "", r.get("pending", "?"), r.get("claimed", "?"),
-                    r.get("done", "?"), r.get("failed", "?")) if "error" not in r else "  %s｜读不了：%s" % (r["name"], r["error"]))
+                    ("，卡住 %d" % r["blocked"]) if r.get("blocked") else "", r.get("done", "?"), r.get("failed", "?"))
+                    if "error" not in r else "  %s｜读不了：%s" % (r["name"], r["error"]))
             return "\n".join(lines), d
         name = safe_positional(a.get("queue"), "queue（队列名）")
-        need_job = act in ("done", "fail", "release", "renew", "cancel", "job", "wait")
+        need_job = act in ("done", "fail", "release", "renew", "cancel", "job", "wait", "decline", "progress", "block", "unblock")
         if need_job and a.get("job") is None:
             raise ToolError("%s 需要 job（任务号）" % act)
         job = a.get("job")
@@ -1785,6 +1920,9 @@ class Server(object):
                 args.append(opt("priority", a["priority"]))
             if a.get("to"):
                 args.append(opt("to", a["to"]))
+            for k in ("needs", "prefers"):
+                if a.get(k):
+                    args.append(opt(k, ",".join(a[k])))
             tmp = self.write_temp(a["text"], ".txt") if a.get("text") else None
             try:
                 if tmp:
@@ -1794,8 +1932,9 @@ class Server(object):
                 if tmp:
                     os.unlink(tmp)
             wait = clamp_int(a.get("wait_seconds"), 0, 3600, 0)
-            text = "已投到队列 %s：任务 #%d「%s」，排第 %d 位%s" % (name, j["id"], j["title"], j.get("position") or 0,
-                                                       "，指派 " + j["to"] if j.get("to") else "")
+            text = "已投到队列 %s：任务 #%d「%s」，排第 %d 位%s；%s" % (
+                name, j["id"], j["title"], j.get("position") or 0, "，指派 " + j["to"] if j.get("to") else "",
+                ("能接的人：" + "、".join(j["takers"])) if j.get("takers") else "暂时没人能接（缺所需技能或权限）")
             if wait <= 0:
                 return text, j
             why = self.queue_final(ctx, name, j["id"], wait)
@@ -1817,8 +1956,10 @@ class Server(object):
                 if key == state["key"] and time.time() - state["at"] < 10:
                     return None  # 队列没变就不去拿锁；租约可能悄悄到期，所以至少每 10 秒试一次
                 state["key"], state["at"] = key, time.time()
-                code, out, err = core.run_cli(self.base + ["queue", "take", "--json", "--", name])
+                code, out, err = core.run_cli(self.base + ["queue", "take", "--json"] + (
+                    [opt("job", a["job"])] if a.get("job") is not None else []) + ["--", name])
                 if code == 3:
+                    state["why"] = json.loads(out).get("why") or {} if out.strip().startswith("{") else {}
                     return None
                 if code != 0:
                     raise ToolError((err or out).strip())
@@ -1828,13 +1969,23 @@ class Server(object):
             if not j and wait > 0:
                 j, why = self.block(ctx, wait, attempt, lambda el: "排队等队列 %s 的任务，已等 %d 秒" % (name, el))
             if not j:
-                return "%s队列 %s 没有可领的任务" % ({"timeout": "等了 %d 秒，" % wait if wait else "现在", "urgent": "等待被紧急来信打断；",
-                                                 "cancelled": "已取消；"}[why], name), {"empty": True, "queue": name, "timeout": why == "timeout"}
+                because = state.get("why") or {}
+                return "%s队列 %s 没有你能领的任务%s" % (
+                    {"timeout": "等了 %d 秒，" % wait if wait else "现在", "urgent": "等待被紧急来信打断；", "cancelled": "已取消；"}[why], name,
+                    ("（排队中的：%s）" % "，".join("%s %d 个" % (k, v) for k, v in sorted(because.items()))) if because else ""), {
+                    "empty": True, "queue": name, "timeout": why == "timeout", "why": because}
             lines = ["已领取：" + self.job_text(j)[0]] + self.job_text(j)[1:]
-            lines.append("做完调 mailbox_queue done（queue=%s, job=%d, text=结果）；要更久调 renew；做不了调 release。" % (name, j["id"]))
+            lines.append(self.job_hint(name, j["id"]))
             return "\n".join(lines), j
-        if act in ("done", "fail", "release", "renew", "cancel"):
+        if act in ("done", "fail", "release", "renew", "cancel", "decline", "progress", "block", "unblock"):
+            if act == "block" and not a.get("text"):
+                raise ToolError("block 要用 text 写明卡在哪、需要谁做什么")
             args = ["queue", act, "--json"] + (["--retry"] if act == "fail" and a.get("retry") else [])
+            if act == "progress":
+                if a.get("pct") is None and not a.get("text"):
+                    raise ToolError("progress 要给 pct（0–100）或 text")
+                if a.get("pct") is not None:
+                    args.append(opt("pct", a["pct"]))
             tmp = self.write_temp(a["text"], ".txt") if a.get("text") else None
             try:
                 if tmp:
@@ -1844,7 +1995,8 @@ class Server(object):
                 if tmp:
                     os.unlink(tmp)
             word = {"done": "完成", "fail": "记为失败" if j["status"] == "failed" else "放回重试", "release": "放回排队",
-                    "renew": "续租", "cancel": "取消"}[act]
+                    "renew": "续租", "cancel": "取消", "decline": "拒绝（以后不再分给你）", "progress": "记下进度",
+                    "block": "标为卡住（已通知主控与投放者，租约暂停）", "unblock": "解除卡住"}[act]
             return "已%s：%s" % (word, self.job_text(j, full=False)[0]), j
         if act == "show":
             d = self.cli(*(["queue", "show", "--json"] + (["--all"] if a.get("all") else []) + ["--", name]), as_json=True)
@@ -2181,6 +2333,8 @@ def build_parser():
     p.add_argument("--model", default=os.environ.get("AGENT_MAILBOX_MODEL", ""), help="本方模型（--init、--join 时登记）")
     p.add_argument("--harness", default=os.environ.get("AGENT_MAILBOX_HARNESS", ""), help="本方宿主或客户端（--init、--join 时登记）")
     p.add_argument("--note", default="", help="申请加入时的附言")
+    p.add_argument("--skills", default=os.environ.get("AGENT_MAILBOX_SKILLS", ""),
+                   help="申请加入时申报的技能标签（逗号分隔），主控批准时确认")
     p.add_argument("--token-file", default=None, help="身份令牌文件（花名册给本方设了令牌时用；也可用环境变量 AGENT_MAILBOX_TOKEN）")
     p.add_argument("--tools", default=os.environ.get("AGENT_MAILBOX_TOOLS", "auto"),
                    help="工具清单：auto 按本方权限只列能用的工具和动作（默认）；all 全部列出、不随权限变；"
