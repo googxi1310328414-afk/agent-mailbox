@@ -248,7 +248,7 @@ to-<箱>-<线程>-<KEY>-STATUS.json        KEY：大写字母数字，可用 - �
 - 谁能领（全部满足）：任务在排队；没指派给别人；在领取名单里（若设了）；有 `queue.take`；具备 `needs` 里的全部技能；没拒绝过这个任务；手上在做的任务（跨全部队列、已领未卡住的）少于本人的 `max_jobs`（没设就看 `policy.max_jobs`）。主控与用户不看技能和上限。
 - 领取顺序：优先级高的先；同优先级里指派给自己的先；再看 `prefers` 命中本人技能多的；最后按 `id`。`take --job N` 领指定的那一个，领不了就报原因；领不到时返回各个排队任务领不了的原因与个数。
 - 领取时 `attempts` 加一。租约到期时还有次数就放回排队，否则判失败并通知投放者。`release` 放回且不算一次尝试，`fail --retry` 还有次数就放回排队。
-- `decline`：领了又不适合，放回排队且不算一次尝试，并记进 `declined`，以后不再分给他；没领的也可以先拒绝。能接的人都拒绝了，就通知主控（`job-unclaimed`）。
+- `decline`：领了又不适合，放回排队且不算一次尝试，并记进 `declined`，以后不再分给他；没领的也可以先拒绝（要有 `queue.take`；指派给别人的任务不用拒绝）。能接的人都拒绝了，就通知主控（`job-unclaimed`），否则再通知手上有空的人。
 - `progress`：记进度并顺带续租；投放者收到 `job-progress`，同一任务 5 分钟内最多一次。
 - `block`：转为 blocked，租约暂停（`lease_until` 清空），通知投放者与主控（`job-blocked`）。`unblock` 由领取方、投放者或有 `queue.admin` 的人做，回到 claimed 并重新计租约。卡住的任务也能 `done`、`fail`、`release`、`decline`。
 - 新任务只通知能接的人：先找手上有空的，都忙就通知所有能接的；没人能接就通知主控（`job-unclaimed`），投放结果里也写明能接的人。
@@ -263,7 +263,7 @@ to-<箱>-<线程>-<KEY>-STATUS.json        KEY：大写字母数字，可用 - �
 - 自动接单只在 MCP 服务里生效：模型调 `mailbox_wait`（空闲）且手上的任务少于上限时，服务按上面的规则替本方领最合适的一个，连同同时到的事件一起交出；这次回应没送到（调用被取消、发送失败）就把任务放回排队。
 
 加入申请 `requests/<名>.json`：
-- 字段：`{"name", "model", "harness", "display", "note", "role", "at", "status": "pending|approved|rejected", "decided_by", "decided_at", "reason"}`。
+- 字段：`{"name", "model", "harness", "display", "note", "role", "skills", "at", "status": "pending|approved|rejected", "decided_by", "decided_at", "reason", "skills_approved"}`；`skills` 是申报的技能，`skills_approved` 是批准时确认的技能（1.3 起）。
 - 同时待批的申请最多 20 个。重复申请只刷新内容，不重复通知。
 
 ## 12. 门铃、通话上限与配额
