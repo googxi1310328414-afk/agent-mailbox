@@ -222,14 +222,19 @@ class McpTest(McpBase):
         self.assertGreaterEqual(r["structuredContent"]["count"], 1)
         prog = [m for m in a.notes("notifications/progress") if m["params"]["progressToken"] == "w1"]
         self.assertGreaterEqual(len(prog), 1)
-        ch = a.notes("notifications/claude/channel")
-        self.assertTrue(ch and "紧急：停测" in ch[-1]["params"]["content"])
-        self.assertEqual(ch[-1]["params"]["meta"]["urgent"], "1")
-        self.assertTrue(all(k.replace("_", "").isalnum() for k in ch[-1]["params"]["meta"]))
-        up = [m for m in a.notes("notifications/resources/updated") if m["params"]["uri"] == "mailbox://inbox"]
-        self.assertTrue(up)
         r = a.call("mailbox_wait", {"timeout_seconds": 2}, timeout=30)
         self.assertTrue(r["structuredContent"].get("timeout"))
+        # 没在等的时候来的信由后台监视推送：频道注入、订阅了的资源更新。
+        # （正在 mailbox_wait 时信随等待结果交出，监视不再重复推送同一封）
+        old = set(id(m) for m in a.msgs)  # 只看这之后收到的推送
+        boss.call("mailbox_send", {"to": "helper-a", "subject": "紧急：再停", "body": "立即停。", "urgent": True})
+        ch = a.wait_for(lambda m: id(m) not in old and m.get("method") == "notifications/claude/channel"
+                        and "紧急：再停" in m["params"]["content"], 20)
+        self.assertIsNotNone(ch)
+        self.assertEqual(ch["params"]["meta"]["urgent"], "1")
+        self.assertTrue(all(k.replace("_", "").isalnum() for k in ch["params"]["meta"]))
+        self.assertIsNotNone(a.wait_for(lambda m: id(m) not in old and m.get("method") == "notifications/resources/updated"
+                                        and m["params"]["uri"] == "mailbox://inbox", 20))
 
     def test_banner_on_other_tools(self):
         boss, a = self.client("boss"), self.client("helper-a")
@@ -535,13 +540,20 @@ class McpCollabTest(McpBase):
         self.assertIn("TALK c1", text_of(w))
         self.assertIn("只回数字", text_of(w))  # 多行消息全文送到
         self.assertFalse(got["say"].get("isError"), text_of(got["say"]))
-        ch = [m for m in a.notes("notifications/claude/channel") if "TALK" in m["params"]["meta"]["kinds"]]
-        self.assertTrue(ch)
-        self.assertTrue([m for m in a.notes("notifications/resources/updated") if m["params"]["uri"] == "mailbox://talk"])
         self.assertNotIn("【新事件】", text_of(boss.call("mailbox_whoami")))  # 回复已随呼叫结果送达，不再重报
         self.assertEqual(a.call("mailbox_talk", {"action": "queue"})["structuredContent"]["queue"], [])
         r = boss.call("mailbox_talk", {"action": "read", "conv": "c1"})
         self.assertEqual(r["structuredContent"]["total"], 2)
+        # 被叫方没在等的时候，新消息由后台监视推送：频道注入、订阅了的资源更新。
+        # （正在 mailbox_wait 时消息随等待结果交出，监视不再重复推送同一条）
+        old = set(id(m) for m in a.msgs)  # 只看这之后收到的推送
+        boss.call("mailbox_talk", {"action": "say", "conv": "c1", "text": "再补一句"})
+        ch = a.wait_for(lambda m: id(m) not in old and m.get("method") == "notifications/claude/channel"
+                        and "再补一句" in m["params"]["content"], 15)
+        self.assertIsNotNone(ch)
+        self.assertIn("TALK", ch["params"]["meta"]["kinds"])
+        self.assertIsNotNone(a.wait_for(lambda m: id(m) not in old and m.get("method") == "notifications/resources/updated"
+                                        and m["params"]["uri"] == "mailbox://talk", 15))
 
     def test_call_timeout_then_late_reply_and_next(self):
         boss, a = self.client("boss"), self.client("helper-a")
@@ -687,6 +699,223 @@ class McpCollabTest(McpBase):
         r = reject.call("mailbox_wait", {"timeout_seconds": 15}, timeout=40)
         self.assertTrue(r["structuredContent"].get("rejected"), text_of(r))
         self.assertIn("不认识", text_of(r))
+
+
+DEFAULT_TIMING = ("--interval", "5", "--coalesce", "2", "--progress-interval", "15")
+
+
+def tool_map(c):
+    return dict((t["name"], t) for t in c.request("tools/list")["result"]["tools"])
+
+
+def actions_of(t):
+    return t["inputSchema"]["properties"]["action"]["enum"]
+
+
+class McpSpeedAndGuardTest(McpBase):
+    """门铃让通话即时送达；工具清单随身份和权限变化；通话安全阀与配额经 MCP 可用。"""
+
+    def test_call_latency_with_default_intervals(self):
+        # 后台监视每 5 秒才查一次；门铃让消息与回复都在一秒内送到（原来分别要等 mailbox_wait、mailbox_call 的轮询间隔）
+        boss, a = self.client("boss", *DEFAULT_TIMING), self.client("helper-a", *DEFAULT_TIMING)
+        boss.init()
+        a.init()
+        time.sleep(1.0)
+        for k in range(2):
+            got = {}
+
+            def callee():
+                w = a.call("mailbox_wait", {"timeout_seconds": 30}, timeout=60)
+                got["t1"] = time.time()
+                conv = w["structuredContent"]["talk"][0]["conv"]
+                got["t2"] = time.time()
+                a.call("mailbox_talk", {"action": "say", "conv": conv, "text": "收到 %d" % k})
+            th = threading.Thread(target=callee)
+            th.start()
+            time.sleep(0.3)  # 被叫方刚进入等待：按原来的 2 秒轮询，要 1.7 秒后才查到
+            t0 = time.time()
+            r = boss.call("mailbox_call", {"to": "helper-a", "text": "第 %d 次" % k, "timeout_seconds": 30}, timeout=60)
+            t3 = time.time()
+            th.join(30)
+            self.assertFalse(r.get("isError"), text_of(r))
+            self.assertEqual([x["text"] for x in r["structuredContent"]["replies"]], ["收到 %d" % k])
+            self.assertLess(got["t1"] - t0, 1.0, "消息送到被叫方太慢")
+            self.assertLess(t3 - got["t2"], 1.5, "回复送回呼叫方太慢")
+
+    def test_tools_follow_role_and_permissions(self):
+        cli(self.mb, "roster", "add", "obs", "--as", "boss", "--role", "observer")
+        boss, a, obs = self.client("boss"), self.client("helper-a", "--no-watch"), self.client("obs", "--no-watch")
+        caps = boss.init()["result"]["capabilities"]
+        self.assertTrue(caps["tools"]["listChanged"])
+        a.init()
+        obs.init()
+        tb, ta, to = tool_map(boss), tool_map(a), tool_map(obs)
+        self.assertEqual(len(tb), 19)
+        self.assertEqual(len(ta), 19)
+        self.assertIn("quota", actions_of(tb["mailbox_perm"]))
+        self.assertEqual(actions_of(ta["mailbox_perm"]), ["list", "show", "check"])
+        self.assertNotIn("limit", ta["mailbox_perm"]["inputSchema"]["properties"])
+        self.assertEqual(actions_of(ta["mailbox_roster"]), ["show", "update", "skills"])  # 助手能申报自己的技能
+        self.assertNotIn("verdict", ta["mailbox_roster"]["inputSchema"]["properties"])  # 批准申报是主控的事
+        self.assertNotIn("display", ta["mailbox_roster"]["inputSchema"]["properties"])
+        self.assertIn("pause", actions_of(tb["mailbox_talk"]))
+        self.assertNotIn("pause", actions_of(ta["mailbox_talk"]))
+        self.assertNotIn("everyone", ta["mailbox_talk"]["inputSchema"]["properties"])  # 没有旁听权限
+        self.assertNotIn("create", actions_of(ta["mailbox_queue"]))
+        self.assertLess(len(json.dumps(list(ta.values()), ensure_ascii=False)), len(json.dumps(list(tb.values()), ensure_ascii=False)))
+        # 旁听者：不能发信、不能通话，但能旁听
+        self.assertNotIn("mailbox_send", to)
+        self.assertNotIn("mailbox_call", to)
+        self.assertEqual(actions_of(to["mailbox_notify"]), ["list"])
+        self.assertNotIn("say", actions_of(to["mailbox_talk"]))
+        self.assertIn("everyone", to["mailbox_talk"]["inputSchema"]["properties"])
+        # 清单之外的工具照样能调：校验按完整定义，真正的判定在权限检查
+        r = obs.call("mailbox_send", {"to": "boss", "subject": "s", "body": "x"})
+        self.assertTrue(r.get("isError"))
+        self.assertIn("权限不足", text_of(r))
+        # 主控授权后，客户端收到 tools/list_changed，再拉清单就有新动作
+        boss.call("mailbox_perm", {"action": "grant", "name": "helper-a", "perms": ["roster.admin"]})
+        a.call("mailbox_whoami")
+        self.assertIsNotNone(a.wait_for(lambda m: m.get("method") == "notifications/tools/list_changed", 15))
+        self.assertIn("approve", actions_of(tool_map(a)["mailbox_roster"]))
+
+    def test_tools_option(self):
+        core_c = self.client("helper-a", "--no-watch", "--tools", "core")
+        core_c.init()
+        self.assertEqual(sorted(tool_map(core_c)), sorted(["mailbox_whoami", "mailbox_wait", "mailbox_inbox", "mailbox_read",
+                                                           "mailbox_send", "mailbox_call", "mailbox_talk", "mailbox_notify"]))
+        pick = self.client("helper-a", "--no-watch", "--tools", "call, wait,mailbox_talk")
+        pick.init()
+        self.assertEqual(sorted(tool_map(pick)), ["mailbox_call", "mailbox_talk", "mailbox_wait"])
+        full = self.client("helper-a", "--no-watch", "--tools", "all")
+        caps = full.init()["result"]["capabilities"]
+        self.assertFalse(caps["tools"]["listChanged"])
+        self.assertIn("quota", actions_of(tool_map(full)["mailbox_perm"]))
+        p = subprocess.run([sys.executable, "-I", "-B", SERVER, "--mailbox", self.mb, "--as", "helper-a", "--tools", "nope"],
+                           stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=60)
+        self.assertEqual(p.returncode, 2)
+        self.assertIn("nope", p.stderr.decode("utf-8", "replace"))
+        self.assertEqual(p.stdout, b"")
+
+    def test_pause_ends_call_and_quota_over_mcp(self):
+        boss, a, b = self.client("boss"), self.client("helper-a"), self.client("helper-b")
+        boss.init()
+        a.init()
+        b.init()
+        r = boss.call("mailbox_roster", {"action": "policy", "talk_max_turns": 2, "talk_burst": "off"})
+        self.assertFalse(r.get("isError"), text_of(r))
+        time.sleep(1.0)
+        got = {}
+
+        def callee():
+            w = b.call("mailbox_wait", {"timeout_seconds": 30}, timeout=60)
+            got["say"] = b.call("mailbox_talk", {"action": "say", "conv": w["structuredContent"]["talk"][0]["conv"], "text": "二"})
+        th = threading.Thread(target=callee)
+        th.start()
+        r = a.call("mailbox_call", {"to": "helper-b", "text": "一", "timeout_seconds": 30}, timeout=60)
+        th.join(30)
+        self.assertFalse(r.get("isError"), text_of(r))
+        self.assertIn("二", text_of(r))
+        # 第二条到了上限：再呼叫立即报暂停，不会白等
+        t0 = time.time()
+        r = a.call("mailbox_call", {"conv": "c1", "text": "三", "timeout_seconds": 30}, timeout=60)
+        self.assertTrue(r.get("isError"))
+        self.assertIn("已暂停", text_of(r))
+        self.assertLess(time.time() - t0, 10)
+        n = boss.wait_for(lambda m: m.get("method") == "notifications/claude/channel" and "自动暂停" in m["params"]["content"], 15)
+        self.assertIsNotNone(n)
+        rd = boss.call("mailbox_talk", {"action": "read", "conv": "c1", "peek": True})
+        self.assertIn("已暂停", text_of(rd))
+        r = a.call("mailbox_talk", {"action": "resume", "conv": "c1"})
+        self.assertTrue(r.get("isError"))  # 只有主控能继续
+        r = boss.call("mailbox_talk", {"action": "resume", "conv": "c1", "max_turns": 10})
+        self.assertFalse(r.get("isError"), text_of(r))
+        r = a.call("mailbox_call", {"conv": "c1", "text": "三", "timeout_seconds": 1})
+        self.assertFalse(r.get("isError"), text_of(r))
+        # 配额
+        r = boss.call("mailbox_perm", {"action": "quota", "name": "helper-a", "perm": "notify", "limit": "1/h"})
+        self.assertFalse(r.get("isError"), text_of(r))
+        self.assertFalse(a.call("mailbox_notify", {"action": "send", "to": "boss", "text": "1"}).get("isError"))
+        r = a.call("mailbox_notify", {"action": "send", "to": "boss", "text": "2"})
+        self.assertTrue(r.get("isError"))
+        self.assertIn("配额用完", text_of(r))
+        self.assertIn("发通知", text_of(a.call("mailbox_perm", {"action": "show"})))
+        r = boss.call("mailbox_perm", {"action": "quota"})
+        self.assertIn("helper-a", text_of(r))
+
+
+
+class McpQueueClaimTest(McpBase):
+    """任务领取经 MCP：空闲自动接单、并发上限、拒绝、进度、技能申报与批准。"""
+
+    def test_auto_take_when_idle(self):
+        cli(self.mb, "roster", "skills", "helper-a", "--as", "boss", "--set", "python")
+        cli(self.mb, "roster", "update", "helper-a", "--as", "helper-a", "--auto-take", "work")
+        cli(self.mb, "queue", "create", "work", "--as", "boss")
+        boss, a = self.client("boss"), self.client("helper-a")
+        boss.init()
+        a.init()
+        self.assertIn("技能", text_of(a.call("mailbox_wait", {"timeout_seconds": 5}, timeout=30)))  # 先取走「技能变更」的通知
+        got = {}
+        th = threading.Thread(target=lambda: got.update(w=a.call("mailbox_wait", {"timeout_seconds": 30}, timeout=60)))
+        th.start()
+        time.sleep(0.5)
+        r = boss.call("mailbox_queue", {"action": "push", "queue": "work", "title": "跑测试", "needs": ["python"]})
+        self.assertIn("能接的人：helper-a", text_of(r))
+        th.join(40)
+        w = got["w"]
+        self.assertIn("【自动接单】", text_of(w))
+        self.assertEqual((w["structuredContent"]["auto_taken"]["id"], w["structuredContent"]["auto_taken"]["claimed_by"]), (1, "helper-a"))
+        # 手上满了（默认 1 个）就不再自动接：新任务只作为通知送到
+        boss.call("mailbox_queue", {"action": "push", "queue": "work", "title": "第二个", "needs": ["python"]})
+        w = a.call("mailbox_wait", {"timeout_seconds": 10}, timeout=30)
+        self.assertNotIn("auto_taken", w["structuredContent"])
+        self.assertIn("第二个", text_of(w))
+        r = a.call("mailbox_queue", {"action": "progress", "queue": "work", "job": 1, "pct": 80, "text": "快好了"})
+        self.assertFalse(r.get("isError"), text_of(r))
+        self.assertFalse(a.call("mailbox_queue", {"action": "done", "queue": "work", "job": 1, "text": "全绿"}).get("isError"))
+        w = a.call("mailbox_wait", {"timeout_seconds": 10}, timeout=30)  # 交完就接下一个
+        self.assertEqual(w["structuredContent"]["auto_taken"]["id"], 2)
+        # 拒绝后不会再被自动接到
+        r = a.call("mailbox_queue", {"action": "decline", "queue": "work", "job": 2, "text": "环境不对"})
+        self.assertFalse(r.get("isError"), text_of(r))
+        w = a.call("mailbox_wait", {"timeout_seconds": 2}, timeout=30)
+        self.assertNotIn("auto_taken", w["structuredContent"])
+        j = boss.call("mailbox_queue", {"action": "job", "queue": "work", "job": 2})["structuredContent"]
+        self.assertEqual((j["status"], [d["who"] for d in j["declined"]]), ("pending", ["helper-a"]))
+
+    def test_skills_and_claim_over_mcp(self):
+        boss, a = self.client("boss"), self.client("helper-a", "--no-watch")
+        boss.init()
+        a.init()
+        r = a.call("mailbox_roster", {"action": "skills", "name": "helper-a", "skills": ["python", "docs"]})
+        self.assertIn("等主控批准", text_of(r))
+        r = boss.call("mailbox_roster", {"action": "skills", "name": "helper-a", "verdict": "approve"})
+        self.assertFalse(r.get("isError"), text_of(r))
+        self.assertEqual(a.call("mailbox_whoami")["structuredContent"]["identity"]["skills"], ["python", "docs"])
+        boss.call("mailbox_queue", {"action": "create", "queue": "work"})
+        boss.call("mailbox_queue", {"action": "push", "queue": "work", "title": "前端", "needs": ["frontend"]})
+        boss.call("mailbox_queue", {"action": "push", "queue": "work", "title": "写文档", "needs": ["python"], "prefers": ["docs"]})
+        r = a.call("mailbox_queue", {"action": "take", "queue": "work", "job": 1})
+        self.assertTrue(r.get("isError"))
+        self.assertIn("缺技能 frontend", text_of(r))
+        r = a.call("mailbox_queue", {"action": "take", "queue": "work"})
+        self.assertEqual(r["structuredContent"]["id"], 2)
+        r = a.call("mailbox_queue", {"action": "block", "queue": "work", "job": 2, "text": "缺样例"})
+        self.assertIn("卡住", text_of(r))
+        r = boss.call("mailbox_queue", {"action": "unblock", "queue": "work", "job": 2, "text": "样例在 docs/x"})
+        self.assertFalse(r.get("isError"), text_of(r))
+        boss.call("mailbox_queue", {"action": "push", "queue": "work", "title": "再一个", "needs": ["python"]})
+        r = a.call("mailbox_queue", {"action": "take", "queue": "work"})  # 手上已有一个
+        self.assertTrue(r["structuredContent"].get("empty"))
+        self.assertEqual(r["structuredContent"]["why"], {"手上已满": 1, "缺技能": 1})
+        self.assertIn("手上已满", text_of(r))
+        for act in ("decline", "progress", "block", "unblock"):  # 这些动作都要给任务号
+            r = a.call("mailbox_queue", {"action": act, "queue": "work", "text": "x"})
+            self.assertTrue(r.get("isError"))
+            self.assertIn("需要 job", text_of(r))
+        r = a.call("mailbox_roster", {"action": "skills", "name": "helper-a"})
+        self.assertIn("同时最多领 1 个", text_of(r))
 
 
 if __name__ == "__main__":

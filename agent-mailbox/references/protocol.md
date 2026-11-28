@@ -124,10 +124,14 @@ to-<箱>-<线程>-<KEY>-STATUS.json        KEY：大写字母数字，可用 - �
 | `policy.assistant_to_assistant` | 助手互通：`allow` / `cc-controller`（自动抄送主控）/ `deny` | `allow` |
 | `policy.broadcast` | 谁能广播：`controller` / `anyone` | `controller` |
 | `policy.inactive_send` | 不在任者能否发信 | `deny` |
+| `policy.talk_max_turns` | 新建通话最多几条发言，到了自动暂停；0 不限（见第 12 节） | 40 |
+| `policy.talk_burst` | 新建通话里两方快速来回到「条数/秒数」就自动暂停；`off` 关闭 | `20/300` |
+| `policy.max_jobs` | 每人同时最多领几个任务（本人设了 `max_jobs` 的以本人为准）；0 不限 | 1 |
+| `quotas` | 配额：`{"<参与方名或 @assistants、@observers>": {"talk": "60/h", ...}}`（见第 12 节） | 无 |
 | `secret_patterns` | 追加的凭据正则 | `[]` |
 | `presets` | 角色预设的整体改写：`{"assistant": [...], "observer": [...]}`（见第 10 节） | 无（由通信策略推出） |
 | `user_token_sha256` | `--as user` 的身份令牌哈希 | 无 |
-| `participants[]` | 参与方：`name`、`role`（controller / assistant / former / observer）、`display`、`model`、`harness`、`session`、`box`、`aliases`、`active`、`since`、`until`、`note`；`allow`、`deny`（主控的显式授予、收回）；`token_sha256`（身份令牌哈希） | |
+| `participants[]` | 参与方：`name`、`role`（controller / assistant / former / observer）、`display`、`model`、`harness`、`session`、`box`、`aliases`、`active`、`since`、`until`、`note`；`allow`、`deny`（主控的显式授予、收回）；`token_sha256`（身份令牌哈希）；`skills`（技能标签）、`skills_proposed`（本人申报、待批的技能）、`max_jobs`（同时最多领几个任务）、`auto_take`（空闲时自动接哪些队列的任务，`*` 表示全部） | |
 
 校验（不通过就拒绝写入）：恰有一名在任主控；在任助手不超过上限且都有收件箱；名字和别名在在任者之间不重复；个人箱不能与主控箱、广播箱同名。
 
@@ -215,8 +219,10 @@ to-<箱>-<线程>-<KEY>-STATUS.json        KEY：大写字母数字，可用 - �
 - `kind` 取值：
   - `note`：有人发的通知；
   - `job`、`job-done`、`job-failed`：派活、领取、取消，任务完成，任务失败；
-  - `perm`：权限变更；
-  - `join`、`joined`：加入申请，加入已批准。
+  - `perm`：权限或配额变更；
+  - `join`、`joined`：加入申请，加入已批准；
+  - `talk-paused`：通话自动暂停（发给主控）；`quota`：谁的配额用完了（发给主控，每个窗口一次）；
+  - `job-progress`、`job-blocked`、`job-unclaimed`：任务进度、任务卡住、任务没人能接；`skills`：技能申报、批准与变更。
 - 文字最多 4 KB，经卫生检查与凭据拦截。
 - 收件人游标里的 `notify_seen` 是已看序号：MCP 送达、命令行 `watch` 报出、`notify list` 列出，都把它往前推。
 - 归档：追加之后若通知流超过 512 KB，在同一把锁里把旧条目移到 `<名>.archive.jsonl`。
@@ -228,7 +234,8 @@ to-<箱>-<线程>-<KEY>-STATUS.json        KEY：大写字母数字，可用 - �
 
 通话：
 - `talk/c<N>.json` 记 `id`、`topic`、`created_by`、`state`（open / closed）、`members`。每个成员有 `name`、`since`（加入时的序号，之前的消息不算未读）、`left`。
-- `talk/c<N>.jsonl` 每行一条：`{"seq", "at", "from", "kind", "text", "reply_to", "urgent"}`。`kind` 取 `msg`（发言）、`join`、`leave`、`close`。文字最多 16 KB。
+  1.3 起另有 `limits`（`max_turns`、`burst`，建通话时从策略复制）、`paused`（`at`、`by`，自动暂停时为空串、`reason`）、`resumed_at` 与 `resumed_seq`（主控让它继续时的时间与最后一条序号）。
+- `talk/c<N>.jsonl` 每行一条：`{"seq", "at", "from", "kind", "text", "reply_to", "urgent"}`。`kind` 取 `msg`（发言）、`join`、`leave`、`close`、`pause`、`resume`；自动暂停的记录 `from` 为空串（显示为「系统」）。文字最多 16 KB。
 - 编号 `c<N>` 在 `locks/talk.lock` 里取最大号加一，元数据文件排他创建；发言、邀请、退出、结束在 `locks/talk-c<N>.lock` 里进行。
 - 成员游标里的 `talk_seen` 记每个通话的已看序号，未读就是序号之后、别人发的记录。
 - **来电队列**：有未读发言的进行中通话，紧急的在前，其余按最早一条未读的时间先来后到。`talk next` 取队首并记为已看；呼叫方看到的「排第几位」就是在这个队列里的位置。
@@ -236,17 +243,45 @@ to-<箱>-<线程>-<KEY>-STATUS.json        KEY：大写字母数字，可用 - �
 
 工作队列 `queues/<队列>.json`：
 - 设置：`lease_seconds`（默认 900）、`max_attempts`（默认 3）、`consumers`（领取名单，空为不限）、`notify`（新任务是否通知可领的人）。
-- 任务 `jobs[]`：`id`、`title`、`body`、`from`、`priority`、`to`（指派）、`status`（pending / claimed / done / failed / cancelled）、`attempts`、`claimed_by`、`lease_until`、`result`、`error`、`log`。
-- 领取顺序：
-  - 优先级高的先；
-  - 同优先级里指派给自己的先；
-  - 再按 `id`；
-  - 指派给别人的领不到。
+- 任务 `jobs[]`：`id`、`title`、`body`、`from`、`priority`、`to`（指派）、`status`（pending / claimed / blocked / done / failed / cancelled）、`attempts`、`claimed_by`、`lease_until`、`result`、`error`、`log`。
+  1.3 起另有 `needs`（所需技能）、`prefers`（加分技能）、`progress`（`pct`、`text`、`at`、`by`）、`blocked`（`at`、`by`、`reason`）、`declined`（`[{who, reason, at}]`）。
+- 谁能领（全部满足）：任务在排队；没指派给别人；在领取名单里（若设了）；有 `queue.take`；具备 `needs` 里的全部技能；没拒绝过这个任务；手上在做的任务（跨全部队列、已领未卡住的）少于本人的 `max_jobs`（没设就看 `policy.max_jobs`）。主控与用户不看技能和上限。
+- 领取顺序：优先级高的先；同优先级里指派给自己的先；再看 `prefers` 命中本人技能多的；最后按 `id`。`take --job N` 领指定的那一个，领不了就报原因；领不到时返回各个排队任务领不了的原因与个数。
 - 领取时 `attempts` 加一。租约到期时还有次数就放回排队，否则判失败并通知投放者。`release` 放回且不算一次尝试，`fail --retry` 还有次数就放回排队。
+- `decline`：领了又不适合，放回排队且不算一次尝试，并记进 `declined`，以后不再分给他；没领的也可以先拒绝（要有 `queue.take`；指派给别人的任务不用拒绝）。能接的人都拒绝了，就通知主控（`job-unclaimed`），否则再通知手上有空的人。
+- `progress`：记进度并顺带续租；投放者收到 `job-progress`，同一任务 5 分钟内最多一次。
+- `block`：转为 blocked，租约暂停（`lease_until` 清空），通知投放者与主控（`job-blocked`）。`unblock` 由领取方、投放者或有 `queue.admin` 的人做，回到 claimed 并重新计租约。卡住的任务也能 `done`、`fail`、`release`、`decline`。
+- 新任务只通知能接的人：先找手上有空的，都忙就通知所有能接的；没人能接就通知主控（`job-unclaimed`），投放结果里也写明能接的人。
+- 队列文件只在真有改动时重写：空领一次不会改写文件、惊动别的等待方。
 - 已结束的任务保留最近 100 个，更早的移到 `<队列>.archive.jsonl`。
 - 排队中的任务最多 500 个；内容与结果各最多 16 KB。
 
+技能：
+- 标签写法：小写字母或数字开头，可含 `. + # _ -`，最长 32 个字符，每人最多 32 个。
+- 申请加入时 `join --skills` 申报，主控 `roster approve --skills` 确认或改写。已在任的人用 `roster skills <本人> --set` 申报，记进 `skills_proposed`，主控 `--approve` 采纳、`--reject` 驳回；主控、用户或有 `roster.admin` 的人也可直接 `--set`。
+- 本人可以改自己的 `auto_take`；`max_jobs` 由主控、用户或有 `roster.admin` 的人设。
+- 自动接单只在 MCP 服务里生效：模型调 `mailbox_wait`（空闲）且手上的任务少于上限时，服务按上面的规则替本方领最合适的一个，连同同时到的事件一起交出；这次回应没送到（调用被取消、发送失败）就把任务放回排队。
+
 加入申请 `requests/<名>.json`：
-- 字段：`{"name", "model", "harness", "display", "note", "role", "at", "status": "pending|approved|rejected", "decided_by", "decided_at", "reason"}`。
+- 字段：`{"name", "model", "harness", "display", "note", "role", "skills", "at", "status": "pending|approved|rejected", "decided_by", "decided_at", "reason", "skills_approved"}`；`skills` 是申报的技能，`skills_approved` 是批准时确认的技能（1.3 起）。
 - 同时待批的申请最多 20 个。重复申请只刷新内容，不重复通知。
+
+## 12. 门铃、通话上限与配额
+
+门铃 `bell/<名>`：
+- 发言、邀请、暂停与继续、发通知、投信之后，写入方给每个收件方的门铃文件追加一个字节（自己的不按）；文件到 64 KB 就截短，截短本身也算响。
+- 等待方先记下本方门铃的 inode、大小与修改时间，再做完整检查；之后每 0.1 秒看一眼，变了就立刻重查。MCP 服务的 `mailbox_wait`、`mailbox_call`、队列等待，命令行的 `watch`、`talk call/say --wait`、`talk wait`、`talk next --wait`、`queue take/push --wait` 都这样等。
+- 门铃只是提示，收件一律以状态为准：漏响（比如写入方是旧版本）只是退回原来的轮询间隔，多响只是多查一次。只读模式不写门铃。
+
+通话上限与自动暂停：
+- 每条发言之后检查：发言数（用户说的不算）到了 `limits.max_turns`；或只有两方、近 `burst` 秒内（且在 `resumed_seq` 之后）来回了 `burst` 条、其间用户没说话。满足其一就把 `paused` 写进元数据，追加一条 `pause` 记录，按响全体成员的门铃，并通知主控。
+- 暂停中只有主控和用户能发言；其他人发言、邀请别人、另开成员相同的通话都会被拒。
+- `talk pause` 由主控或用户手动暂停。`talk resume` 清掉 `paused`，记下 `resumed_at`、`resumed_seq`：带 `--max-turns` 就改上限（0 不限），不带时若因上限而停，上限改为「已有条数 + 策略条数（至少 10）」；带 `--burst` 改快速来回的门槛。
+- 没有 `limits` 的通话（1.3 之前建的）不受限。
+
+配额：
+- 花名册 `quotas` 的键是参与方名或 `@assistants`、`@observers`，值是 `{动作: 写法}`。动作：`talk`（每条发言）、`call`（每次新开通话）、`send`（每次发信，演练不算）、`notify`（每次发通知）、`queue.push`（每个任务）。写法「次数/窗口」，窗口 `m`、`h`、`d`；`none` 明确不限（压过角色组的配额）。
+- 判定：点名的优先于角色组的；主控与用户不受限。
+- 用量记在 `usage/<名>.json`：每个动作在窗口内的时间戳（最多「次数」个），在 `locks/usage-<名>.lock` 里读改写。用完时操作被拒，并在每个窗口里最多通知主控一次（`warned`）。
+- `perm quota` 由主控或用户设置，`perm show` 显示生效的配额与本窗口已用次数。
 - 批准时按申请加入花名册：已是前任的，重新在任，旧箱里的历史信记为已读。可顺带写 `allow`、`deny`，这一步只有主控能做。

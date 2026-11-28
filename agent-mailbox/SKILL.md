@@ -95,21 +95,28 @@ mailbox.py ... --as <你> talk invite c3 --to glm-1     # 邀请；talk leave �
 - 呼叫时会告诉你对方监视是否在线、这个通话排在对方来电队列第几位；超时不是失败，回复到了照样送来。
 - 收到 `TALK` 事件就用 `talk say` 回复；同时有几个来电时用 `talk next` 按顺序接。
 - 在通话里发言，要对其中每个在任成员都有 `talk` 权限；主控随时可以加入任何通话，有 `talk.audit` 的旁听者可以读任何通话。
+- 新建的通话最多 40 条发言；只有两方时，5 分钟内来回 20 条也会自动暂停，防止停不下来的循环。暂停后只有主控和用户能说话：**不要另开通话或换工具绕过**，等主控 `talk resume`（可带 `--max-turns`）或 `talk close`。主控也可以 `talk pause` 叫停。默认值由主控用 `roster policy --talk-max-turns / --talk-burst` 改。
 
 ## 5. 工作队列：排队派活、领活
 
 ```bash
 mailbox.py ... --as <主控> queue create review --desc "代码评审" --lease 1800   # 建队列（租约秒数、最多尝试次数、领取名单）
-mailbox.py ... --as <主控> queue push review --title "审 PR 12" --text "看 diff 与测试" --priority 5   # 投任务；--to 指派给某人
-mailbox.py ... --as <你>   queue take review --wait 300     # 领下一个任务；没有就排队等
+mailbox.py ... --as <主控> queue push review --title "审 PR 12" --text "看 diff 与测试" --needs python,review --priority 5   # 投任务，不必指定人；--to 指派给某人
+mailbox.py ... --as <你>   queue take review --wait 300     # 领你能领的里面排最前的；没有就排队等（--job 7 领指定的）
+mailbox.py ... --as <你>   queue progress review 7 --pct 40 --text "看完一半"   # 报进度，顺带续租
+mailbox.py ... --as <你>   queue block review 7 --text "缺测试账号"   # 卡住了：通知主控，租约暂停；主控 queue unblock 后继续
+mailbox.py ... --as <你>   queue decline review 7 --text "不熟前端"   # 不适合我：放回排队，以后不再分给我
 mailbox.py ... --as <你>   queue done review 7 --text "LGTM，报告在 D:/run/REVIEW.md"   # 交结果，投放者会收到通知
 mailbox.py ... --as <你>   queue renew review 7             # 做得久就续租；做不了 queue release 放回；失败 queue fail [--retry]
 mailbox.py ... --as <主控> queue wait review 7 --timeout 600   # 等任务结束拿结果；queue show / job 查看
 ```
 
-- 领取顺序：优先级高的先；同优先级里指派给你的先；其余按投放先后。指派给别人的你领不到。
+- 谁能领：具备任务要求的全部技能（`--needs`）、没拒绝过、手上在做的少于上限（默认 1 个）。领不到时会告诉你原因（缺技能、手上已满……）。
+- 领取顺序：优先级高的先；同优先级里指派给你的先；再看加分技能（`--prefers`）命中多的；其余按投放先后。
+- 新任务只通知能接的人；没人能接时主控会收到通知。
 - 领到的任务有租约（默认 900 秒），到期没完成就放回排队；用完尝试次数（默认 3 次）就判失败并通知投放者。
-- 只领自己做得了的；做不了立刻 `release`，不要占着。
+- 只领自己做得了的：不适合就 `decline` 写明原因，做不了就 `release`，不要占着；卡住了 `block` 说清缺什么。
+- 用 MCP 时可以开**自动接单**：`roster update <你> --auto-take review`（`*` 表示全部队列）。之后调 `mailbox_wait` 空闲等待时，服务直接替你领最合适的任务交给你。
 
 ## 6. 通知
 
@@ -172,9 +179,11 @@ mailbox.py ... --as <你>   roster update <你> --session 01a1xxxx --model ...  
 新模型也可以自己申请加入，排队等主控批准：
 
 ```bash
-mailbox.py ... --as glm-1 join --model glm-4.6 --note "擅长写测试" --wait 600    # 申请；MCP 里启动时加 --join 即可
-mailbox.py ... --as <主控> roster requests                                     # 待批的申请
-mailbox.py ... --as <主控> roster approve glm-1 --allow talk:lead --deny broadcast   # 批准，可顺带授权；roster reject glm-1 --reason …
+mailbox.py ... --as glm-1 join --model glm-4.6 --skills python,testing --note "擅长写测试" --wait 600    # 申请并申报技能；MCP 里启动时加 --join --skills …
+mailbox.py ... --as <主控> roster requests                                     # 待批的申请（含申报的技能）
+mailbox.py ... --as <主控> roster approve glm-1 --skills python,testing --allow talk:lead   # 批准，可确认或改写技能、顺带授权；roster reject glm-1 --reason …
+mailbox.py ... --as <你>   roster skills <你> --set python,review,docs          # 已在任的人申报技能；主控 roster skills <名> --approve 或 --reject
+mailbox.py ... --as <主控> roster update kimi-1 --max-jobs 2                    # 让某人同时最多领 2 个任务；roster policy --max-jobs 改默认
 ```
 
 ## 10. 权限：主控按人分配
@@ -187,6 +196,8 @@ mailbox.py ... --as <主控> perm revoke kimi-1 talk:claude-a                 # 
 mailbox.py ... --as <主控> perm reset kimi-1                                # 回到角色预设
 mailbox.py ... --as <主控> perm preset assistant --remove broadcast         # 改整个角色的预设
 mailbox.py ... --as <主控> perm token lead --out ~/.lead.token              # 身份令牌：防止别人用 --as 冒充（另见 perm token user）
+mailbox.py ... --as <主控> perm quota @assistants call 20/h                # 配额：每人每小时最多新开 20 个通话；perm quota 列出全部
+mailbox.py ... --as <主控> perm quota kimi-1 talk 60/h                     # 点名的优先；none 明确不限，off 去掉
 ```
 
 - 权限写作「键[:范围]」，范围可以是某人、角色组（`@controller`、`@assistants`、`@observers`）或队列名：
@@ -194,7 +205,8 @@ mailbox.py ... --as <主控> perm token lead --out ~/.lead.token              # 
 - 主控与用户永远拥有全部权限。助手默认能写信、通知、通话、投任务、领任务、写状态板，不能广播。旁听者默认只能旁听通话。
 - 默认预设由通信策略推出：`policy` 设成助手互通 `deny`，预设就只剩对主控和旁听者的权限；设成广播 `anyone`，预设就带上 `broadcast`。
 - 判定：显式条目里取最具体的一条（点名 > 角色组 > 不限），同样具体时收回优先；没有显式条目才看角色预设。
-- **被拒时不要换身份、换工具或手写文件绕过去**：如实告诉主控需要什么权限，由主控决定。
+- 配额限制一段时间内的次数：`talk`（发言）、`call`（新开通话）、`send`（发信）、`notify`（发通知）、`queue.push`（投任务），写作 `60/h`、`10/m`、`500/d`。主控与用户不受限；用完时操作被拒，主控收到通知。
+- **被拒时不要换身份、换工具或手写文件绕过去**：如实告诉主控需要什么权限或配额，由主控决定。
 
 ## 11. 体检与出错
 

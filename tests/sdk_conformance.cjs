@@ -75,9 +75,14 @@ async function connect(me) {
 	}
 	ok(/SDK 等待中来信/.test(got), "mailbox_wait 在来信时返回", got);
 	ok(progress >= 1, "等待期间收到进度通知，且按进度续命没有超时", "progress=" + progress);
-	await sleep(500);
-	ok(a.seen.some(n => n.method === "notifications/claude/channel" && /SDK 等待中来信/.test(n.params.content)), "收到频道推送");
-	ok(a.seen.some(n => n.method === "notifications/resources/updated" && n.params.uri === "mailbox://inbox"), "收到资源更新通知");
+	// 没在等的时候来的信由后台监视推送（正在 mailbox_wait 时信随等待结果交出，监视不再重复推送同一封）
+	const start = a.seen.length;  // 只看这之后收到的推送
+	await boss.client.callTool({ name: "mailbox_send", arguments: { to: "helper-a", subject: "SDK 没在等时来信", body: "x" } });
+	const pushed = () => a.seen.slice(start).some(n => n.method === "notifications/claude/channel" && /SDK 没在等时来信/.test(n.params.content));
+	const updated = () => a.seen.slice(start).some(n => n.method === "notifications/resources/updated" && n.params.uri === "mailbox://inbox");
+	for (let i = 0; i < 80 && !(pushed() && updated()); i++) await sleep(250);
+	ok(pushed(), "没在等时收到频道推送");
+	ok(updated(), "收到资源更新通知");
 	ok(a.seen.some(n => n.method === "notifications/message"), "收到日志通知");
 	r = await a.client.callTool({ name: "mailbox_send", arguments: { subject: "缺正文" } });
 	ok(r.isError === true, "工具错误以 isError 返回");
